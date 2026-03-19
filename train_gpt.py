@@ -103,6 +103,7 @@ class Hyperparameters:
         int(os.environ.get("FINAL_ROUNDTRIP_EVAL", os.environ.get("FINAL_INT8_ROUNDTRIP_EVAL", "1")))
     )
     final_int8_roundtrip_eval = final_roundtrip_eval
+    submission_size_budget_bytes = int(os.environ.get("SUBMISSION_SIZE_BUDGET_BYTES", str(16 * 1024 * 1024)))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1415,9 +1416,21 @@ def main() -> None:
         torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
+        raw_total_submission = model_bytes + code_bytes
+        raw_budget_delta = args.submission_size_budget_bytes - raw_total_submission
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
-        log0(f"Total submission size: {model_bytes + code_bytes} bytes")
+        log0(f"Total submission size: {raw_total_submission} bytes")
+        if raw_budget_delta >= 0:
+            log0(
+                f"submission_budget raw_total:{raw_total_submission} budget:{args.submission_size_budget_bytes} "
+                f"headroom_bytes:{raw_budget_delta}"
+            )
+        else:
+            log0(
+                f"submission_budget raw_total:{raw_total_submission} budget:{args.submission_size_budget_bytes} "
+                f"over_bytes:{-raw_budget_delta}"
+            )
 
     resolved_compressor, compressor_note = resolve_compressor(args.compressor)
     quant_obj, quant_stats = quantize_state_dict(
@@ -1448,7 +1461,19 @@ def main() -> None:
             f"Serialized model {args.quant_scheme}+{resolved_compressor}: {quant_file_bytes} bytes "
             f"(payload:{quant_stats['payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size {args.quant_scheme}+{resolved_compressor}: {quant_file_bytes + code_bytes} bytes")
+        quant_total_submission = quant_file_bytes + code_bytes
+        quant_budget_delta = args.submission_size_budget_bytes - quant_total_submission
+        log0(f"Total submission size {args.quant_scheme}+{resolved_compressor}: {quant_total_submission} bytes")
+        if quant_budget_delta >= 0:
+            log0(
+                f"submission_budget {args.quant_scheme}+{resolved_compressor} total:{quant_total_submission} "
+                f"budget:{args.submission_size_budget_bytes} headroom_bytes:{quant_budget_delta}"
+            )
+        else:
+            log0(
+                f"submission_budget {args.quant_scheme}+{resolved_compressor} total:{quant_total_submission} "
+                f"budget:{args.submission_size_budget_bytes} over_bytes:{-quant_budget_delta}"
+            )
         with open("final_export_manifest.json", "w", encoding="utf-8") as f:
             json.dump(
                 {
@@ -1461,7 +1486,9 @@ def main() -> None:
                     "artifact_name": artifact_name,
                     "artifact_bytes": quant_file_bytes,
                     "code_bytes": code_bytes,
-                    "total_submission_bytes": quant_file_bytes + code_bytes,
+                    "total_submission_bytes": quant_total_submission,
+                    "submission_size_budget_bytes": args.submission_size_budget_bytes,
+                    "budget_headroom_bytes": quant_budget_delta,
                     "baseline_tensor_bytes": quant_stats["baseline_tensor_bytes"],
                     "payload_bytes": quant_stats["payload_bytes"],
                     "raw_torch_bytes": quant_raw_bytes,
