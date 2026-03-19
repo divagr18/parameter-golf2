@@ -44,7 +44,7 @@ Happy training!
 
 If you have an Apple laptop or desktop with Apple Silicon, we've set up a simple MLX training script to help you start iterating locally.
 
-If you don't have a Mac with Apple Silicon, you can run an adapted version of this script without MLX support. Just ask [Codex](https://openai.com/codex/) to refactor it; the change is straightforward. It may still be fairly slow, so we recommend jumping straight to cloud GPUs with Runpod.
+If you don't have a Mac with Apple Silicon, you can run the PyTorch path directly (`train_gpt.py`) on CPU or CUDA. This is slower than MLX for local iteration, so we still recommend moving to cloud GPUs quickly.
 
 First, clone the repository, create a fresh Python environment, and install the packages needed for the MLX path plus dataset download:
 
@@ -78,6 +78,29 @@ python3 train_gpt_mlx.py
 ```
 
 Validation always runs on the full `fineweb_val_*` split, which is the fixed first-50k-document set. The smoke command above skips periodic validation and just prints the final `val_loss` and `val_bpb` once at the end.
+
+### Training Your First Model (Non-MLX / PyTorch)
+
+Install the non-MLX dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Run a small local smoke job:
+
+```bash
+RUN_ID=torch_smoke \
+DEVICE=cpu \
+USE_TORCH_COMPILE=0 \
+ITERATIONS=200 \
+TRAIN_BATCH_TOKENS=8192 \
+VAL_LOSS_EVERY=0 \
+VAL_BATCH_SIZE=8192 \
+python3 train_gpt.py
+```
+
+If you have an NVIDIA GPU, switch to `DEVICE=cuda` (and optionally `USE_TORCH_COMPILE=1`).
 
 ### Scaling Up to a Remote Machine
 
