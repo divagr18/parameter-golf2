@@ -1010,12 +1010,28 @@ def main() -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     device_override = os.environ.get("DEVICE", "").strip().lower()
+    grad_accum_override = os.environ.get("GRAD_ACCUM_STEPS", "").strip()
     if world_size <= 0:
         raise ValueError(f"WORLD_SIZE must be positive, got {world_size}")
-    if 8 % world_size != 0:
-        raise ValueError(f"WORLD_SIZE={world_size} must divide 8 so grad_accum_steps stays integral")
-    grad_accum_steps = 8 // world_size
+    if grad_accum_override:
+        grad_accum_steps = int(grad_accum_override)
+        if grad_accum_steps <= 0:
+            raise ValueError(f"GRAD_ACCUM_STEPS must be positive, got {grad_accum_steps}")
+    else:
+        if 8 % world_size != 0:
+            raise ValueError(
+                f"WORLD_SIZE={world_size} must divide 8 for default grad accumulation; "
+                "set GRAD_ACCUM_STEPS explicitly to override"
+            )
+        grad_accum_steps = 8 // world_size
     grad_scale = 1.0 / grad_accum_steps
+    tokens_per_microstep = world_size * grad_accum_steps * args.train_seq_len
+    if args.train_batch_tokens % tokens_per_microstep != 0:
+        raise ValueError(
+            "TRAIN_BATCH_TOKENS must be divisible by WORLD_SIZE*GRAD_ACCUM_STEPS*TRAIN_SEQ_LEN; "
+            f"got TRAIN_BATCH_TOKENS={args.train_batch_tokens}, WORLD_SIZE={world_size}, "
+            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
     if device_override:
         if device_override == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("DEVICE=cuda requested but CUDA is unavailable")
