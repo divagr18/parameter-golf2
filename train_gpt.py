@@ -70,6 +70,9 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    recurrent_core_layers = int(os.environ.get("RECURRENT_CORE_LAYERS", 0))
+    recurrent_steps = int(os.environ.get("RECURRENT_STEPS", 0))
+    share_ffn_across_blocks = bool(int(os.environ.get("SHARE_FFN_ACROSS_BLOCKS", "0")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -870,31 +873,69 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        recurrent_core_layers: int = 0,
+        recurrent_steps: int = 0,
+        share_ffn_across_blocks: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
+        if (recurrent_core_layers > 0) != (recurrent_steps > 0):
+            raise ValueError(
+                "RECURRENT_CORE_LAYERS and RECURRENT_STEPS must both be > 0 for recurrence mode, "
+                f"got RECURRENT_CORE_LAYERS={recurrent_core_layers}, RECURRENT_STEPS={recurrent_steps}"
+            )
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.num_encoder_layers = num_layers // 2
-        self.num_decoder_layers = num_layers - self.num_encoder_layers
-        self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.blocks = nn.ModuleList(
-            [
-                Block(
-                    model_dim,
-                    num_heads,
-                    num_kv_heads,
-                    mlp_mult,
-                    rope_base,
-                    qk_gain_init,
-                )
-                for i in range(num_layers)
-            ]
+        self.use_recurrence = recurrent_core_layers > 0 and recurrent_steps > 0
+        self.recurrent_core_layers = recurrent_core_layers
+        self.recurrent_steps = recurrent_steps
+        self.share_ffn_across_blocks = share_ffn_across_blocks
+        self.total_effective_layers = (
+            recurrent_core_layers * recurrent_steps if self.use_recurrence else num_layers
         )
+        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        if self.use_recurrence:
+            self.num_encoder_layers = 0
+            self.num_decoder_layers = 0
+            self.num_skip_weights = 0
+            self.skip_weights = nn.Parameter(torch.ones(0, model_dim, dtype=torch.float32))
+            self.blocks = nn.ModuleList(
+                [
+                    Block(
+                        model_dim,
+                        num_heads,
+                        num_kv_heads,
+                        mlp_mult,
+                        rope_base,
+                        qk_gain_init,
+                    )
+                    for _ in range(recurrent_core_layers)
+                ]
+            )
+            if share_ffn_across_blocks and len(self.blocks) > 1:
+                shared_mlp = self.blocks[0].mlp
+                for i in range(1, len(self.blocks)):
+                    self.blocks[i].mlp = shared_mlp
+        else:
+            self.num_encoder_layers = num_layers // 2
+            self.num_decoder_layers = num_layers - self.num_encoder_layers
+            self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+            self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+            self.blocks = nn.ModuleList(
+                [
+                    Block(
+                        model_dim,
+                        num_heads,
+                        num_kv_heads,
+                        mlp_mult,
+                        rope_base,
+                        qk_gain_init,
+                    )
+                    for _ in range(num_layers)
+                ]
+            )
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -912,16 +953,20 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
-        skips: list[Tensor] = []
-
-        # First half stores skips; second half reuses them in reverse order.
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        if self.use_recurrence:
+            for _ in range(self.recurrent_steps):
+                for block in self.blocks:
+                    x = block(x, x0)
+        else:
+            skips: list[Tensor] = []
+            # First half stores skips; second half reuses them in reverse order.
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, x0)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -1105,6 +1150,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        recurrent_core_layers=args.recurrent_core_layers,
+        recurrent_steps=args.recurrent_steps,
+        share_ffn_across_blocks=args.share_ffn_across_blocks,
     ).to(device=device, dtype=torch.bfloat16 if autocast_enabled else torch.float32)
     if autocast_enabled:
         for module in base_model.modules():
@@ -1172,6 +1220,18 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"sdp_backends:{sdp_backends_log}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    if base_model.use_recurrence:
+        log0(
+            f"architecture:recurrent core_layers:{base_model.recurrent_core_layers} "
+            f"recurrent_steps:{base_model.recurrent_steps} "
+            f"effective_layers:{base_model.total_effective_layers} "
+            f"share_ffn_across_blocks:{base_model.share_ffn_across_blocks}"
+        )
+    else:
+        log0(
+            f"architecture:stacked num_layers:{args.num_layers} "
+            f"encoder_layers:{base_model.num_encoder_layers} decoder_layers:{base_model.num_decoder_layers}"
+        )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
