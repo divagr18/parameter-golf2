@@ -176,6 +176,13 @@ set_default_env WEIGHT_ORDER "none"
 set_default_env MIXED_LOW_PRECISION_SCHEME "int8"
 set_default_env NUM_LAYERS "9"
 
+if [[ "${COMPRESSOR}" == "auto" || "${COMPRESSOR}" == "zstd" ]]; then
+  if ! "${PYTHON_BIN:-python}" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('zstandard') else 1)" >/dev/null 2>&1; then
+    echo "Warning: zstandard package not found; COMPRESSOR=${COMPRESSOR} will use zlib fallback and may miss 16MB budget." >&2
+    echo "Install with: ${PYTHON_BIN:-python} -m pip install zstandard" >&2
+  fi
+fi
+
 if [[ -n "${PHASE3_CAPACITY_TESTS:-}" ]]; then
   declare -A allowed=()
   IFS=',' read -r -a requested <<<"$PHASE3_CAPACITY_TESTS"
