@@ -144,7 +144,9 @@ function Build-ModeProfile([string]$Mode) {
                     @{ Name = "recur_3x6_d768_share"; ModelDim = "768"; Core = "3"; Steps = "6"; Share = "1" },
                     @{ Name = "recur_3x6_d832_share"; ModelDim = "832"; Core = "3"; Steps = "6"; Share = "1" },
                     @{ Name = "recur_3x6_d896_share"; ModelDim = "896"; Core = "3"; Steps = "6"; Share = "1" },
-                    @{ Name = "recur_3x6_d960_share"; ModelDim = "960"; Core = "3"; Steps = "6"; Share = "1" }
+                    @{ Name = "recur_3x6_d960_share"; ModelDim = "960"; Core = "3"; Steps = "6"; Share = "1" },
+                    @{ Name = "recur_3x6_d1024_share"; ModelDim = "1024"; Core = "3"; Steps = "6"; Share = "1" },
+                    @{ Name = "recur_3x6_d1152_share"; ModelDim = "1152"; Core = "3"; Steps = "6"; Share = "1" }
                 )
             }
         }
@@ -158,7 +160,9 @@ function Build-ModeProfile([string]$Mode) {
                 Tests = @(
                     @{ Name = "recur_3x6_d832_share"; ModelDim = "832"; Core = "3"; Steps = "6"; Share = "1" },
                     @{ Name = "recur_3x6_d896_share"; ModelDim = "896"; Core = "3"; Steps = "6"; Share = "1" },
-                    @{ Name = "recur_3x6_d960_share"; ModelDim = "960"; Core = "3"; Steps = "6"; Share = "1" }
+                    @{ Name = "recur_3x6_d960_share"; ModelDim = "960"; Core = "3"; Steps = "6"; Share = "1" },
+                    @{ Name = "recur_3x6_d1024_share"; ModelDim = "1024"; Core = "3"; Steps = "6"; Share = "1" },
+                    @{ Name = "recur_3x6_d1152_share"; ModelDim = "1152"; Core = "3"; Steps = "6"; Share = "1" }
                 )
             }
         }
