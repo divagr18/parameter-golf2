@@ -28,11 +28,16 @@ fi
 if [[ -n "${NPROC_PER_NODE:-}" ]]; then
   nproc_per_node="${NPROC_PER_NODE}"
 else
-  if [[ "${gpu_count}" -ge 2 ]]; then
-    nproc_per_node="2"
-  else
-    nproc_per_node="1"
-  fi
+  nproc_per_node="${gpu_count}"
+fi
+
+if [[ "${nproc_per_node}" -lt 1 ]]; then
+  echo "NPROC_PER_NODE must be >=1, got ${nproc_per_node}" >&2
+  exit 1
+fi
+if [[ "${nproc_per_node}" -gt "${gpu_count}" ]]; then
+  echo "NPROC_PER_NODE=${nproc_per_node} exceeds visible GPU count=${gpu_count}" >&2
+  exit 1
 fi
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
@@ -53,15 +58,15 @@ export MAX_WALLCLOCK_SECONDS="600"
 export WARMUP_STEPS="40"
 export TRAIN_LOG_EVERY="200"
 
-# Throughput tuning (auto-sized for 1x/2x GPU)
-if [[ "${nproc_per_node}" -ge 2 ]]; then
-  export TRAIN_BATCH_TOKENS="${TRAIN_BATCH_TOKENS:-131072}"
-  export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-262144}"
-else
-  export TRAIN_BATCH_TOKENS="${TRAIN_BATCH_TOKENS:-65536}"
-  export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-131072}"
-fi
 export GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
+local_train_tokens_per_rank="${LOCAL_TRAIN_TOKENS_PER_RANK:-32768}"
+local_val_tokens_per_rank="${LOCAL_VAL_TOKENS_PER_RANK:-65536}"
+default_train_batch_tokens=$(( nproc_per_node * GRAD_ACCUM_STEPS * local_train_tokens_per_rank ))
+default_val_batch_size=$(( nproc_per_node * GRAD_ACCUM_STEPS * local_val_tokens_per_rank ))
+
+# Throughput tuning scales with world size by default; can still be overridden externally.
+export TRAIN_BATCH_TOKENS="${TRAIN_BATCH_TOKENS:-${default_train_batch_tokens}}"
+export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-${default_val_batch_size}}"
 
 # Validation / export
 export VAL_LOSS_EVERY="0"
@@ -84,7 +89,7 @@ export NUM_KV_HEADS="4"
 
 echo "Launching H100 run: RUN_ID=${RUN_ID}"
 echo "CUDA GPUs detected=${gpu_count} using nproc_per_node=${nproc_per_node}"
-echo "Config: TRAIN_BATCH_TOKENS=${TRAIN_BATCH_TOKENS} GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS} MAX_WALLCLOCK_SECONDS=${MAX_WALLCLOCK_SECONDS}"
+echo "Config: TRAIN_BATCH_TOKENS=${TRAIN_BATCH_TOKENS} VAL_BATCH_SIZE=${VAL_BATCH_SIZE} GRAD_ACCUM_STEPS=${GRAD_ACCUM_STEPS} MAX_WALLCLOCK_SECONDS=${MAX_WALLCLOCK_SECONDS}"
 echo "Config: MODEL_DIM=${MODEL_DIM} NUM_HEADS=${NUM_HEADS} NUM_KV_HEADS=${NUM_KV_HEADS} RECURRENT_CORE_LAYERS=${RECURRENT_CORE_LAYERS} RECURRENT_STEPS=${RECURRENT_STEPS}"
 
 torchrun --standalone --nnodes=1 --nproc_per_node="${nproc_per_node}" train_gpt.py
