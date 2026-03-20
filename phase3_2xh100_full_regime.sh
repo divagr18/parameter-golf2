@@ -61,7 +61,7 @@ else
   export TRAIN_BATCH_TOKENS="${TRAIN_BATCH_TOKENS:-65536}"
   export VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-131072}"
 fi
-export GRAD_ACCUM_STEPS="2"
+export GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-2}"
 
 # Validation / export
 export VAL_LOSS_EVERY="0"
