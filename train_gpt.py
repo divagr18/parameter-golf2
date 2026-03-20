@@ -901,7 +901,9 @@ class GPT(nn.Module):
             self.num_encoder_layers = 0
             self.num_decoder_layers = 0
             self.num_skip_weights = 0
-            self.skip_weights = nn.Parameter(torch.ones(0, model_dim, dtype=torch.float32))
+            # In recurrence mode skip_weights are unused; keep as buffer so DDP
+            # doesn't expect gradients for an empty parameter tensor.
+            self.register_buffer("skip_weights", torch.ones(0, model_dim, dtype=torch.float32), persistent=False)
             self.blocks = nn.ModuleList(
                 [
                     Block(
