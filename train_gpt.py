@@ -62,6 +62,7 @@ class Hyperparameters:
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -819,15 +820,28 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, use_swiglu: bool = False):
         super().__init__()
-        hidden = mlp_mult * dim
-        self.fc = CastedLinear(dim, hidden, bias=False)
-        self.proj = CastedLinear(hidden, dim, bias=False)
-        self.proj._zero_init = True
+        self.use_swiglu = use_swiglu
+        if use_swiglu:
+            # SwiGLU with the same parameter budget as relu²:
+            # relu² uses 2 matrices of (dim × mlp_mult*dim) = 2*mlp_mult*dim² params.
+            # SwiGLU uses 3 matrices of (dim × h): 3*h*dim params.
+            # Equating: h = (2/3)*mlp_mult*dim. Round down to multiple of 64 for hardware alignment.
+            hidden = max(64, (2 * mlp_mult * dim // 3 // 64) * 64)
+            self.gate = CastedLinear(dim, hidden, bias=False)
+            self.fc = CastedLinear(dim, hidden, bias=False)
+            self.proj = CastedLinear(hidden, dim, bias=False)
+            self.proj._zero_init = True
+        else:
+            hidden = mlp_mult * dim
+            self.fc = CastedLinear(dim, hidden, bias=False)
+            self.proj = CastedLinear(hidden, dim, bias=False)
+            self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.use_swiglu:
+            return self.proj(F.silu(self.gate(x)) * self.fc(x))
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
@@ -841,12 +855,13 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        use_swiglu: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, use_swiglu=use_swiglu)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -877,6 +892,7 @@ class GPT(nn.Module):
         recurrent_core_layers: int = 0,
         recurrent_steps: int = 0,
         share_ffn_across_blocks: bool = False,
+        use_swiglu: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -913,6 +929,7 @@ class GPT(nn.Module):
                         mlp_mult,
                         rope_base,
                         qk_gain_init,
+                        use_swiglu=use_swiglu,
                     )
                     for _ in range(recurrent_core_layers)
                 ]
@@ -935,6 +952,7 @@ class GPT(nn.Module):
                         mlp_mult,
                         rope_base,
                         qk_gain_init,
+                        use_swiglu=use_swiglu,
                     )
                     for _ in range(num_layers)
                 ]
@@ -1172,6 +1190,7 @@ def main() -> None:
         recurrent_core_layers=args.recurrent_core_layers,
         recurrent_steps=args.recurrent_steps,
         share_ffn_across_blocks=args.share_ffn_across_blocks,
+        use_swiglu=args.use_swiglu,
     ).to(device=device, dtype=torch.bfloat16 if autocast_enabled else torch.float32)
     if autocast_enabled:
         for module in base_model.modules():
@@ -1238,7 +1257,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"sdp_backends:{sdp_backends_log}")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} use_swiglu:{args.use_swiglu}")
     if base_model.use_recurrence:
         log0(
             f"architecture:recurrent core_layers:{base_model.recurrent_core_layers} "
