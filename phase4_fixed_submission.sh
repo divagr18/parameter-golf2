@@ -61,20 +61,23 @@ fi
 
 # -----------------------------------------------------------------
 # BUG FIX 3+4: Compute global batch properly for current GPU count.
-# With 8 GPUs and GRAD_ACCUM=1, we want 524288 global tokens.
-# local_tokens_per_rank = 524288 / (nproc * accum)
-# Must be divisible by TRAIN_SEQ_LEN=1024.
+# TARGET_GLOBAL_TOKENS (default 524288) is divided across GPUs × accum steps.
+# Override with TARGET_GLOBAL_TOKENS=65536 for 1-GPU runs to avoid OOM.
+# If TRAIN_BATCH_TOKENS is set directly it takes priority over the computed value.
 # -----------------------------------------------------------------
 export GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
-target_global_tokens=524288
 seq_len=1024
-local_tokens=$(( target_global_tokens / (nproc_per_node * GRAD_ACCUM_STEPS) ))
-# Round down to nearest multiple of seq_len
-local_tokens=$(( (local_tokens / seq_len) * seq_len ))
-if [[ "${local_tokens}" -lt "${seq_len}" ]]; then
-  local_tokens="${seq_len}"
+if [[ -z "${TRAIN_BATCH_TOKENS:-}" ]]; then
+  target_global_tokens="${TARGET_GLOBAL_TOKENS:-524288}"
+  local_tokens=$(( target_global_tokens / (nproc_per_node * GRAD_ACCUM_STEPS) ))
+  local_tokens=$(( (local_tokens / seq_len) * seq_len ))
+  if [[ "${local_tokens}" -lt "${seq_len}" ]]; then
+    local_tokens="${seq_len}"
+  fi
+  export TRAIN_BATCH_TOKENS=$(( nproc_per_node * GRAD_ACCUM_STEPS * local_tokens ))
+else
+  local_tokens=$(( TRAIN_BATCH_TOKENS / (nproc_per_node * GRAD_ACCUM_STEPS) ))
 fi
-export TRAIN_BATCH_TOKENS=$(( nproc_per_node * GRAD_ACCUM_STEPS * local_tokens ))
 export VAL_BATCH_SIZE=$(( nproc_per_node * GRAD_ACCUM_STEPS * local_tokens * 2 ))
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
