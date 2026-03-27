@@ -98,7 +98,7 @@ export VOCAB_SIZE="${VOCAB_SIZE:-1024}"
 # -----------------------------------------------------------------
 export ITERATIONS="${ITERATIONS:-20000}"
 export MAX_WALLCLOCK_SECONDS="${MAX_WALLCLOCK_SECONDS:-600}"  # FIX: was 360
-export WARMUP_STEPS="${WARMUP_STEPS:-20}"
+export WARMUP_STEPS="${WARMUP_STEPS:-200}"  # longer warmup avoids Muon overshoot spike at step 2
 export TRAIN_LOG_EVERY="${TRAIN_LOG_EVERY:-200}"
 
 # Validation
