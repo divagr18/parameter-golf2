@@ -146,7 +146,7 @@ export MATRIX_LR="${MATRIX_LR:-0.04}"
 export SCALAR_LR="${SCALAR_LR:-0.04}"
 export EMBED_LR="${EMBED_LR:-0.6}"
 export TIED_EMBED_LR="${TIED_EMBED_LR:-0.05}"
-export WARMDOWN_ITERS="${WARMDOWN_ITERS:-1200}"
+export WARMDOWN_ITERS="${WARMDOWN_ITERS:-3000}"  # 3000 × 44ms ≈ 132s = 22% of 600s budget
 
 export SEED="${SEED:-1337}"
 
