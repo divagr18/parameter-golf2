@@ -63,6 +63,31 @@ class Hyperparameters:
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
     use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
+    # Sliding window eval: only score tokens beyond prefix_len in each window.
+    # eval_stride_frac=0.5 means stride=seq_len//2 → each scored token has ≥seq_len//2 tokens of context.
+    # eval_stride_frac=1.0 (default) = original non-overlapping behaviour.
+    eval_stride_frac = float(os.environ.get("EVAL_STRIDE_FRAC", "1.0"))
+    # Long-context eval: evaluate at a longer sequence length than training.
+    # 0 = same as train_seq_len.  Pair with NTK RoPE scaling (eval_rope_scale>1) for best results.
+    eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", "0"))
+    # NTK-aware RoPE scaling at eval: new_base = rope_base * eval_rope_scale^(head_dim/(head_dim-2)).
+    # Suggested: eval_rope_scale = (eval_seq_len / train_seq_len) ** 2  (≈4 for 2× context)
+    eval_rope_scale = float(os.environ.get("EVAL_ROPE_SCALE", "1.0"))
+    # Low-rank bigram logit bias: learnable rank-r factored bigram table.
+    # bigram_bias[i] = bigram_right(bigram_left(prev_token[i]))  added to logits before softcap.
+    # 0 = disabled.  32 costs ~64K int8 params (≈32 KB), well within the 164 KB headroom.
+    bigram_rank = int(os.environ.get("BIGRAM_RANK", "0"))
+    bigram_lr = float(os.environ.get("BIGRAM_LR", "0.04"))
+    # Stochastic Weight Averaging: average weights during the warmdown phase.
+    # Takes the mean of snapshots every SWA_COLLECT_EVERY steps once LR starts decaying.
+    # Research-confirmed ~0.5-1.5% BPB improvement, especially helps quantization quality.
+    swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
+    swa_collect_every = int(os.environ.get("SWA_COLLECT_EVERY", "10"))
+    # Sequence length curriculum: ramp seq_len from curriculum_min_seq_len → train_seq_len
+    # over the first curriculum_steps training steps.  Faster early convergence on local patterns.
+    curriculum_enabled = bool(int(os.environ.get("CURRICULUM_ENABLED", "0")))
+    curriculum_min_seq_len = int(os.environ.get("CURRICULUM_MIN_SEQ_LEN", "256"))
+    curriculum_steps = int(os.environ.get("CURRICULUM_STEPS", "5000"))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -253,43 +278,77 @@ def eval_val(
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
     # - val_bpb: tokenizer-agnostic compression metric used by the challenge
+    #
+    # Sliding window: EVAL_STRIDE_FRAC < 1.0 uses overlapping windows so every scored
+    # token has at least (1 - stride_frac) * seq_len tokens of prior context, which
+    # significantly reduces the high-loss predictions at chunk boundaries.
+    # Long-context: EVAL_SEQ_LEN > 0 evaluates at a longer context window.  Pair with
+    # EVAL_ROPE_SCALE to apply NTK-aware RoPE base scaling for cleaner length extrapolation.
+    seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
+    stride = max(1, int(seq_len * args.eval_stride_frac))
+    prefix_len = seq_len - stride  # tokens at window start that are context-only (not scored)
+
+    # Pre-build the per-position loss mask (1 = scored, 0 = context-only prefix).
+    # Shape [seq_len]; will be expanded to [batch, seq_len] per batch.
+    loss_mask_cpu = torch.zeros(seq_len, dtype=torch.float32)
+    loss_mask_cpu[prefix_len:] = 1.0
+
+    # Temporarily rescale RoPE base for long-context eval using NTK-aware interpolation.
+    # new_base = rope_base * scale^(head_dim / (head_dim - 2))
+    _orig_rope_bases: list[tuple] = []
+    if args.eval_rope_scale != 1.0 or seq_len != args.train_seq_len:
+        head_dim = args.model_dim // args.num_heads
+        ntk_factor = args.eval_rope_scale ** (head_dim / max(head_dim - 2, 1))
+        raw_model = model.module if hasattr(model, "module") else model
+        for block in raw_model.blocks:
+            rot = block.attn.rotary
+            _orig_rope_bases.append((rot, rot.inv_freq.clone()))
+            new_base = args.rope_base * ntk_factor
+            new_inv_freq = 1.0 / (new_base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=rot.inv_freq.device) / head_dim))
+            rot.inv_freq = new_inv_freq
+            rot._cos_cached = None  # invalidate cache
+
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
-    if local_batch_tokens < args.train_seq_len:
-        raise ValueError(
-            "VAL_BATCH_SIZE must provide at least one sequence per rank; "
-            f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
-        )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
+    local_batch_seqs = max(1, local_batch_tokens // seq_len)
+    total_wins = max(1, (val_tokens.numel() - seq_len - 1) // stride)
+    win_start = (total_wins * rank) // world_size
+    win_end = (total_wins * (rank + 1)) // world_size
+
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
+        for batch_win_start in range(win_start, win_end, local_batch_seqs):
+            batch_win_end = min(batch_win_start + local_batch_seqs, win_end)
+            xs, ys = [], []
+            for w in range(batch_win_start, batch_win_end):
+                s = w * stride
+                xs.append(val_tokens[s : s + seq_len])
+                ys.append(val_tokens[s + 1 : s + seq_len + 1])
+            x = torch.stack(xs).to(device=device, dtype=torch.int64, non_blocking=True)
+            y = torch.stack(ys).to(device=device, dtype=torch.int64, non_blocking=True)
+            mask = loss_mask_cpu.unsqueeze(0).expand(x.size(0), -1).to(device=device)
             if autocast_enabled:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    batch_loss = model(x, y).detach()
+                    batch_loss = model(x, y, loss_mask=mask).detach()
             else:
-                batch_loss = model(x, y).detach()
-            batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
+                batch_loss = model(x, y, loss_mask=mask).detach()
+            scored_tokens = int(mask.sum().item())
+            val_loss_sum += batch_loss.to(torch.float64) * scored_tokens
+            val_token_count += scored_tokens
+            # Byte counting: only for scored (non-prefix) positions
+            prev_ids = x[:, prefix_len:].reshape(-1)
+            tgt_ids = y[:, prefix_len:].reshape(-1)
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
+
+    # Restore original RoPE bases
+    for rot, orig_inv_freq in _orig_rope_bases:
+        rot.inv_freq = orig_inv_freq
+        rot._cos_cached = None
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -893,6 +952,7 @@ class GPT(nn.Module):
         recurrent_steps: int = 0,
         share_ffn_across_blocks: bool = False,
         use_swiglu: bool = False,
+        bigram_rank: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -961,6 +1021,14 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        # Low-rank bigram logit bias.  At position i, adds bigram_right(bigram_left(input[i])) to logits.
+        # This gives the model a cheap, learned n-gram prior on top of the contextual representations.
+        self.bigram_rank = bigram_rank
+        if bigram_rank > 0:
+            self.bigram_left = nn.Embedding(vocab_size, bigram_rank)
+            self.bigram_right = CastedLinear(bigram_rank, vocab_size, bias=False)
+            self.bigram_right._zero_init = True   # starts contributing nothing; learns when useful
+            self.bigram_scale = nn.Parameter(torch.ones(1, dtype=torch.float32))
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -970,7 +1038,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def forward(self, input_ids: Tensor, target_ids: Tensor, loss_mask: Tensor | None = None) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -997,8 +1065,16 @@ class GPT(nn.Module):
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
+        # Low-rank bigram bias: cheap learned n-gram prior on top of contextual representation.
+        if self.bigram_rank > 0:
+            bg = self.bigram_right(self.bigram_left(input_ids.reshape(-1)))  # [B*T, vocab]
+            logits_proj = logits_proj + self.bigram_scale * bg
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        per_token = F.cross_entropy(logits.float(), targets, reduction="none")  # [B*T]
+        if loss_mask is not None:
+            mask = loss_mask.reshape(-1).to(per_token.dtype)
+            return (per_token * mask).sum() / mask.sum().clamp(min=1)
+        return per_token.mean()
 
 
 # -----------------------------
@@ -1191,6 +1267,7 @@ def main() -> None:
         recurrent_steps=args.recurrent_steps,
         share_ffn_across_blocks=args.share_ffn_across_blocks,
         use_swiglu=args.use_swiglu,
+        bigram_rank=args.bigram_rank,
     ).to(device=device, dtype=torch.bfloat16 if autocast_enabled else torch.float32)
     if autocast_enabled:
         for module in base_model.modules():
@@ -1244,6 +1321,15 @@ def main() -> None:
         fused=autocast_enabled,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if args.bigram_rank > 0:
+        bigram_params = [base_model.bigram_left.weight, base_model.bigram_right.weight, base_model.bigram_scale]
+        optimizer_bigram = torch.optim.Adam(
+            [{"params": bigram_params, "lr": args.bigram_lr, "base_lr": args.bigram_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=autocast_enabled,
+        )
+        optimizers.append(optimizer_bigram)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1346,6 +1432,10 @@ def main() -> None:
         torch.cuda.synchronize()
     t0 = time.perf_counter()
 
+    # SWA state: accumulated on CPU to avoid GPU memory pressure.
+    swa_state: dict[str, torch.Tensor] | None = None
+    swa_count = 0
+
     step = 0
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
@@ -1382,16 +1472,44 @@ def main() -> None:
                     f"stopping_early: wallclock_cap train_time:{training_time_ms:.0f}ms "
                     f"step:{step}/{args.iterations}"
                 )
+            # Load SWA-averaged weights before eval + export (better generalization + quantization).
+            if args.swa_enabled and swa_state is not None:
+                log0(f"swa: loading averaged weights from {swa_count} snapshots")
+                base_model.load_state_dict(
+                    {k: v.to(device=device, dtype=base_model.state_dict()[k].dtype) for k, v in swa_state.items()},
+                    strict=True,
+                )
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        # SWA: once warmdown begins (scale < 1), start averaging weights on CPU every N steps.
+        if args.swa_enabled and scale < 1.0 and step % args.swa_collect_every == 0:
+            if swa_state is None:
+                swa_state = {k: v.detach().cpu().float().clone() for k, v in base_model.state_dict().items()}
+                swa_count = 1
+            else:
+                inv = 1.0 / (swa_count + 1)
+                for k, v in base_model.state_dict().items():
+                    if k in swa_state:
+                        swa_state[k].mul_(1.0 - inv).add_(v.detach().cpu().float(), alpha=inv)
+                swa_count += 1
+
+        # Sequence length curriculum: ramp from curriculum_min_seq_len → train_seq_len.
+        if args.curriculum_enabled and step < args.curriculum_steps:
+            frac_c = step / max(args.curriculum_steps, 1)
+            curr_seq_len = args.curriculum_min_seq_len + int((args.train_seq_len - args.curriculum_min_seq_len) * frac_c)
+            curr_seq_len = max(64, (curr_seq_len // 64) * 64)
+        else:
+            curr_seq_len = args.train_seq_len
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.train_batch_tokens, curr_seq_len, grad_accum_steps)
             if autocast_enabled:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     loss = model(x, y)

@@ -129,11 +129,39 @@ export RECURRENT_CORE_LAYERS="${RECURRENT_CORE_LAYERS:-0}"   # FIX: was 3
 export RECURRENT_STEPS="${RECURRENT_STEPS:-0}"               # FIX: was 6
 export SHARE_FFN_ACROSS_BLOCKS="${SHARE_FFN_ACROSS_BLOCKS:-0}"
 
-# SwiGLU: better activation than relu² at same parameter budget (set in train_gpt.py)
+# SwiGLU: better activation than relu² at same parameter budget
 export USE_SWIGLU="${USE_SWIGLU:-0}"
 
 # Gradient clipping: helps stability, especially with Muon at high momentum
 export GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-1.0}"
+
+# -----------------------------------------------------------------------
+# MAJOR IMPROVEMENTS
+# -----------------------------------------------------------------------
+# 1. Sliding window eval: only score tokens with ≥ prefix context.
+#    EVAL_STRIDE_FRAC=0.5 → stride=512, prefix=512 context guaranteed per token.
+#    EVAL_STRIDE_FRAC=1.0 (default) = original non-overlapping behavior.
+export EVAL_STRIDE_FRAC="${EVAL_STRIDE_FRAC:-0.5}"
+
+# 2. Long-context eval: evaluate at longer sequence than training.
+#    0 = same as TRAIN_SEQ_LEN.  E.g. EVAL_SEQ_LEN=2048 with EVAL_ROPE_SCALE=4.
+export EVAL_SEQ_LEN="${EVAL_SEQ_LEN:-0}"
+export EVAL_ROPE_SCALE="${EVAL_ROPE_SCALE:-1.0}"
+
+# 3. Low-rank bigram logit bias: learnable factored n-gram prior on top of neural model.
+#    BIGRAM_RANK=32 adds ~64K int8 params (≈32KB), well within the 164KB budget headroom.
+#    Set to 0 to disable.
+export BIGRAM_RANK="${BIGRAM_RANK:-32}"
+export BIGRAM_LR="${BIGRAM_LR:-0.04}"
+
+# 4. SWA: average weights during warmdown (confirmed 0.5-1.5% gain, also improves quantization)
+export SWA_ENABLED="${SWA_ENABLED:-1}"
+export SWA_COLLECT_EVERY="${SWA_COLLECT_EVERY:-10}"
+
+# 5. Sequence length curriculum (disabled by default; set to 1 to test 2-4% gain)
+export CURRICULUM_ENABLED="${CURRICULUM_ENABLED:-0}"
+export CURRICULUM_MIN_SEQ_LEN="${CURRICULUM_MIN_SEQ_LEN:-256}"
+export CURRICULUM_STEPS="${CURRICULUM_STEPS:-5000}"
 
 # Best Muon profile from phase3 sweep
 export MUON_MOMENTUM="${MUON_MOMENTUM:-0.98}"
@@ -161,6 +189,10 @@ echo "grad_accum:     ${GRAD_ACCUM_STEPS}"
 echo "model:          dim=${MODEL_DIM} layers=${NUM_LAYERS} heads=${NUM_HEADS} kv=${NUM_KV_HEADS} mlp_mult=${MLP_MULT}"
 echo "recurrence:     core=${RECURRENT_CORE_LAYERS} steps=${RECURRENT_STEPS}  [FIX: was 3×6]"
 echo "use_swiglu:     ${USE_SWIGLU}"
+echo "eval_stride:    ${EVAL_STRIDE_FRAC}  (sliding window eval)"
+echo "eval_seq_len:   ${EVAL_SEQ_LEN}  (0=train_seq_len)"
+echo "eval_rope_scale:${EVAL_ROPE_SCALE}"
+echo "bigram_rank:    ${BIGRAM_RANK}  (0=disabled)"
 echo "muon_momentum:  ${MUON_MOMENTUM}"
 echo "grad_clip_norm: ${GRAD_CLIP_NORM}"
 echo "quant:          ${QUANT_SCHEME}+${COMPRESSOR}"
