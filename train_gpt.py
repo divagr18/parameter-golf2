@@ -92,9 +92,10 @@ class Hyperparameters:
     # to tolerate quantisation noise, dramatically reducing the roundtrip BPB penalty.
     # QAT_SCHEME: "none" | "int8" | "int4"  (should match QUANT_SCHEME at export)
     # QAT_START_STEP: delay QAT until the model has partially converged (avoids
-    # destabilising early training; 1500-2000 works well for ~13K-step runs).
+    # destabilising early training. Rule of thumb: start at ~65% of expected total steps.
+    # For 1-GPU ~6500-step runs: 4500. For 8-GPU ~13500-step runs: 9000.
     qat_scheme = os.environ.get("QAT_SCHEME", "none").strip().lower()
-    qat_start_step = int(os.environ.get("QAT_START_STEP", "1500"))
+    qat_start_step = int(os.environ.get("QAT_START_STEP", "9000"))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
