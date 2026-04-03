@@ -88,6 +88,13 @@ class Hyperparameters:
     curriculum_enabled = bool(int(os.environ.get("CURRICULUM_ENABLED", "0")))
     curriculum_min_seq_len = int(os.environ.get("CURRICULUM_MIN_SEQ_LEN", "256"))
     curriculum_steps = int(os.environ.get("CURRICULUM_STEPS", "5000"))
+    # Quantization-Aware Training: fake-quantise weights during forward to teach the model
+    # to tolerate quantisation noise, dramatically reducing the roundtrip BPB penalty.
+    # QAT_SCHEME: "none" | "int8" | "int4"  (should match QUANT_SCHEME at export)
+    # QAT_START_STEP: delay QAT until the model has partially converged (avoids
+    # destabilising early training; 1500-2000 works well for ~13K-step runs).
+    qat_scheme = os.environ.get("QAT_SCHEME", "none").strip().lower()
+    qat_start_step = int(os.environ.get("QAT_START_STEP", "1500"))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -781,11 +788,35 @@ class RMSNorm(nn.Module):
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
 
+def _fake_quantize_row(w: Tensor, levels: int) -> Tensor:
+    """Per-row fake-quantise a 2D weight with a straight-through estimator (STE).
+
+    Matches the per-row clipping used by quantize_float_tensor_int8/int4 at export,
+    but uses amax instead of quantile for speed in the hot forward path.
+    levels=256 → int8 symmetric (range −127…127)
+    levels=16  → int4 symmetric (range −7…7)
+    """
+    half = float(levels // 2 - (1 if levels == 16 else 0))  # 127 for int8, 7 for int4
+    w32 = w.float()
+    clip_abs = w32.abs().amax(dim=1).clamp_min(1e-6)        # per-row max scale
+    scale = clip_abs / half
+    w_scaled = (w32 / scale.unsqueeze(1)).clamp(-half, half)
+    # STE: round in forward, identity in backward
+    w_ste = w_scaled + (w_scaled.round() - w_scaled).detach()
+    return (w_ste * scale.unsqueeze(1)).to(w.dtype)
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # QAT: set qat_levels to 256 (int8) or 16 (int4) to enable fake-quantisation.
+    qat_levels: int = 0   # class-level switch updated from the training loop
+
     def forward(self, x: Tensor) -> Tensor:
+        w = self.weight
+        if __class__.qat_levels > 0 and w.ndim == 2:
+            w = _fake_quantize_row(w, __class__.qat_levels)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.weight.to(x.dtype), bias)
+        return F.linear(x, w.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1343,7 +1374,7 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"sdp_backends:{sdp_backends_log}")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} use_swiglu:{args.use_swiglu}")
+    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} use_swiglu:{args.use_swiglu} qat_scheme:{args.qat_scheme} qat_start_step:{args.qat_start_step}")
     if base_model.use_recurrence:
         log0(
             f"architecture:recurrent core_layers:{base_model.recurrent_core_layers} "
@@ -1495,6 +1526,14 @@ def main() -> None:
                     if k in swa_state:
                         swa_state[k].mul_(1.0 - inv).add_(v.detach().cpu().float(), alpha=inv)
                 swa_count += 1
+
+        # QAT: enable fake-quantisation once model has partially converged.
+        # Triggers one torch.compile recompile at qat_start_step, then stable.
+        if args.qat_scheme != "none":
+            target_levels = (256 if args.qat_scheme == "int8" else 16) if step >= args.qat_start_step else 0
+            if CastedLinear.qat_levels != target_levels:
+                CastedLinear.qat_levels = target_levels
+                log0(f"qat: {'enabled' if target_levels > 0 else 'disabled'} levels:{target_levels} step:{step}")
 
         # Sequence length curriculum: ramp from curriculum_min_seq_len → train_seq_len.
         if args.curriculum_enabled and step < args.curriculum_steps:
