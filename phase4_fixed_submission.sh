@@ -141,6 +141,14 @@ export SSM_EVERY_N="${SSM_EVERY_N:-2}"
 export SSM_EXPAND="${SSM_EXPAND:-2.0}"
 export SSM_KERNEL="${SSM_KERNEL:-4}"
 
+# Multi-token prediction (training-only auxiliary loss).
+export MTP_ENABLED="${MTP_ENABLED:-0}"
+export MTP_STEPS="${MTP_STEPS:-2}"
+export MTP_WEIGHT="${MTP_WEIGHT:-0.3}"
+export MTP_DECAY="${MTP_DECAY:-1.0}"
+export MTP_TIE_EMBEDDINGS="${MTP_TIE_EMBEDDINGS:-1}"
+export MTP_LR="${MTP_LR:-0.02}"
+
 # Gradient clipping: helps stability, especially with Muon at high momentum
 export GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-1.0}"
 
@@ -199,6 +207,7 @@ echo "model:          dim=${MODEL_DIM} layers=${NUM_LAYERS} heads=${NUM_HEADS} k
 echo "recurrence:     core=${RECURRENT_CORE_LAYERS} steps=${RECURRENT_STEPS}  [FIX: was 3×6]"
 echo "use_swiglu:     ${USE_SWIGLU}"
 echo "use_ssm:        ${USE_SSM} (every_n=${SSM_EVERY_N} expand=${SSM_EXPAND} kernel=${SSM_KERNEL})"
+echo "use_mtp:        ${MTP_ENABLED} (steps=${MTP_STEPS} weight=${MTP_WEIGHT} decay=${MTP_DECAY} tie=${MTP_TIE_EMBEDDINGS} lr=${MTP_LR})"
 echo "eval_stride:    ${EVAL_STRIDE_FRAC}  (sliding window eval)"
 echo "eval_seq_len:   ${EVAL_SEQ_LEN}  (0=train_seq_len)"
 echo "eval_rope_scale:${EVAL_ROPE_SCALE}"

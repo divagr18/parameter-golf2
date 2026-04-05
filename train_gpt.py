@@ -88,6 +88,13 @@ class Hyperparameters:
     curriculum_enabled = bool(int(os.environ.get("CURRICULUM_ENABLED", "0")))
     curriculum_min_seq_len = int(os.environ.get("CURRICULUM_MIN_SEQ_LEN", "256"))
     curriculum_steps = int(os.environ.get("CURRICULUM_STEPS", "5000"))
+    # Multi-token prediction (MTP): auxiliary future-token losses used during training.
+    mtp_enabled = bool(int(os.environ.get("MTP_ENABLED", "0")))
+    mtp_steps = int(os.environ.get("MTP_STEPS", "2"))
+    mtp_weight = float(os.environ.get("MTP_WEIGHT", "0.3"))
+    mtp_decay = float(os.environ.get("MTP_DECAY", "1.0"))
+    mtp_tie_embeddings = bool(int(os.environ.get("MTP_TIE_EMBEDDINGS", "1")))
+    mtp_lr = float(os.environ.get("MTP_LR", "0.02"))
     # Hybrid SSM blocks (Mamba-style approximation): periodically replace attention blocks
     # with a causal depthwise-conv gated mixer.
     use_ssm = bool(int(os.environ.get("USE_SSM", "0")))
@@ -979,6 +986,19 @@ class SSMMixer(nn.Module):
         return self.out_proj(y)
 
 
+class MTPBranch(nn.Module):
+    """Per-horizon residual branch for multi-token prediction."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.norm = RMSNorm()
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.scale = nn.Parameter(torch.ones(1, dtype=torch.float32))
+
+    def forward(self, h: Tensor) -> Tensor:
+        return h + self.scale.to(dtype=h.dtype) * self.proj(self.norm(h))
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -1043,6 +1063,11 @@ class GPT(nn.Module):
         share_ffn_across_blocks: bool = False,
         use_swiglu: bool = False,
         bigram_rank: int = 0,
+        mtp_enabled: bool = False,
+        mtp_steps: int = 2,
+        mtp_weight: float = 0.3,
+        mtp_decay: float = 1.0,
+        mtp_tie_embeddings: bool = True,
         use_ssm: bool = False,
         ssm_every_n: int = 2,
         ssm_expand: float = 2.0,
@@ -1067,6 +1092,11 @@ class GPT(nn.Module):
         self.ssm_every_n = ssm_every_n
         self.ssm_expand = ssm_expand
         self.ssm_kernel = ssm_kernel
+        self.mtp_enabled = mtp_enabled and mtp_steps > 0
+        self.mtp_steps = max(0, mtp_steps)
+        self.mtp_weight = max(0.0, mtp_weight)
+        self.mtp_decay = mtp_decay
+        self.mtp_tie_embeddings = mtp_tie_embeddings
         self.total_effective_layers = (
             recurrent_core_layers * recurrent_steps if self.use_recurrence else num_layers
         )
@@ -1131,6 +1161,17 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        if self.mtp_enabled:
+            self.mtp_branches = nn.ModuleList([MTPBranch(model_dim) for _ in range(self.mtp_steps)])
+            if self.mtp_tie_embeddings and self.tie_embeddings:
+                self.mtp_heads = None
+            else:
+                self.mtp_heads = nn.ModuleList([CastedLinear(model_dim, vocab_size, bias=False) for _ in range(self.mtp_steps)])
+            self.mtp_step_weights = [self.mtp_decay**i for i in range(self.mtp_steps)]
+        else:
+            self.mtp_branches = None
+            self.mtp_heads = None
+            self.mtp_step_weights = []
         # Low-rank bigram logit bias.  At position i, adds bigram_right(bigram_left(input[i])) to logits.
         # This gives the model a cheap, learned n-gram prior on top of the contextual representations.
         self.bigram_rank = bigram_rank
@@ -1167,24 +1208,56 @@ class GPT(nn.Module):
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
+        h = self.final_norm(x)
+        flat_h = h.reshape(-1, h.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(flat_h, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
+            logits_proj = self.lm_head(flat_h)
         # Low-rank bigram bias: cheap learned n-gram prior on top of contextual representation.
         if self.bigram_rank > 0:
             bg = self.bigram_right(self.bigram_left(input_ids.reshape(-1)))  # [B*T, vocab]
             logits_proj = logits_proj + self.bigram_scale * bg
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        per_token = F.cross_entropy(logits.float(), targets, reduction="none")  # [B*T]
+        base_per_token = F.cross_entropy(logits.float(), targets, reduction="none")  # [B*T]
         if loss_mask is not None:
-            mask = loss_mask.reshape(-1).to(per_token.dtype)
-            return (per_token * mask).sum() / mask.sum().clamp(min=1)
-        return per_token.mean()
+            mask = loss_mask.reshape(-1).to(base_per_token.dtype)
+            base_loss = (base_per_token * mask).sum() / mask.sum().clamp(min=1)
+        else:
+            base_loss = base_per_token.mean()
+
+        # Keep eval metric comparable by applying MTP only when loss_mask is not provided.
+        if not self.mtp_enabled or self.mtp_weight <= 0.0 or loss_mask is not None:
+            return base_loss
+
+        _, seqlen = target_ids.shape
+        weighted_aux = torch.zeros((), device=base_loss.device, dtype=base_loss.dtype)
+        weight_sum = 0.0
+        if self.mtp_branches is not None:
+            for step_idx in range(self.mtp_steps):
+                horizon = step_idx + 1  # 1 predicts token at t+2, 2 predicts t+3, ...
+                if seqlen - horizon <= 0:
+                    continue
+                branch_h = self.mtp_branches[step_idx](h[:, : seqlen - horizon, :])
+                branch_flat_h = branch_h.reshape(-1, branch_h.size(-1))
+                future_targets = target_ids[:, horizon:].reshape(-1)
+                if self.mtp_heads is None:
+                    aux_logits_proj = F.linear(branch_flat_h, self.tok_emb.weight)
+                else:
+                    aux_logits_proj = self.mtp_heads[step_idx](branch_flat_h)
+                aux_logits = self.logit_softcap * torch.tanh(aux_logits_proj / self.logit_softcap)
+                aux_loss = F.cross_entropy(aux_logits.float(), future_targets, reduction="mean")
+                w = float(self.mtp_step_weights[step_idx]) if step_idx < len(self.mtp_step_weights) else 1.0
+                weighted_aux = weighted_aux + aux_loss.to(weighted_aux.dtype) * w
+                weight_sum += w
+
+        if weight_sum <= 0.0:
+            return base_loss
+        aux_loss = weighted_aux / weight_sum
+        return base_loss + self.mtp_weight * aux_loss
 
 
 # -----------------------------
@@ -1378,6 +1451,11 @@ def main() -> None:
         share_ffn_across_blocks=args.share_ffn_across_blocks,
         use_swiglu=args.use_swiglu,
         bigram_rank=args.bigram_rank,
+        mtp_enabled=args.mtp_enabled,
+        mtp_steps=args.mtp_steps,
+        mtp_weight=args.mtp_weight,
+        mtp_decay=args.mtp_decay,
+        mtp_tie_embeddings=args.mtp_tie_embeddings,
         use_ssm=args.use_ssm,
         ssm_every_n=args.ssm_every_n,
         ssm_expand=args.ssm_expand,
@@ -1444,6 +1522,21 @@ def main() -> None:
             fused=autocast_enabled,
         )
         optimizers.append(optimizer_bigram)
+    if args.mtp_enabled and base_model.mtp_branches is not None:
+        mtp_params: list[nn.Parameter] = []
+        for branch in base_model.mtp_branches:
+            mtp_params.extend(list(branch.parameters()))
+        if base_model.mtp_heads is not None:
+            for head in base_model.mtp_heads:
+                mtp_params.extend(list(head.parameters()))
+        if mtp_params:
+            optimizer_mtp = torch.optim.Adam(
+                [{"params": mtp_params, "lr": args.mtp_lr, "base_lr": args.mtp_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                fused=autocast_enabled,
+            )
+            optimizers.append(optimizer_mtp)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1461,6 +1554,8 @@ def main() -> None:
         f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
         f"use_swiglu:{args.use_swiglu} use_ssm:{args.use_ssm} ssm_every_n:{args.ssm_every_n} "
         f"ssm_expand:{args.ssm_expand} ssm_kernel:{args.ssm_kernel} "
+        f"mtp_enabled:{args.mtp_enabled} mtp_steps:{args.mtp_steps} mtp_weight:{args.mtp_weight} "
+        f"mtp_decay:{args.mtp_decay} mtp_tie_embeddings:{args.mtp_tie_embeddings} "
         f"qat_scheme:{args.qat_scheme} qat_start_step:{args.qat_start_step}"
     )
     if base_model.use_recurrence:
@@ -1480,7 +1575,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} mtp_lr:{args.mtp_lr if args.mtp_enabled else 0.0}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
