@@ -89,8 +89,21 @@ elapsed
 # -------------------------------------------------------------------
 step "3/4  Python packages  (requirements.txt + zstandard)"
 # -------------------------------------------------------------------
-log "installing requirements.txt + zstandard with uv ..."
-uv pip install --link-mode=copy -U -r requirements.txt zstandard
+log "installing requirements.txt with uv ..."
+uv pip install --link-mode=copy -U -r requirements.txt
+elapsed
+
+# zstandard: try pre-built binary first (no C compilation = no hangs).
+# Fall back to source build only if no wheel is available.
+log "installing zstandard (binary wheel preferred) ..."
+if uv pip install --link-mode=copy "zstandard>=0.22" --no-build 2>/dev/null; then
+  log "zstandard installed from pre-built wheel"
+elif uv pip install --link-mode=copy "zstandard>=0.22" 2>/dev/null; then
+  log "zstandard installed (compiled from source)"
+else
+  log "WARNING: uv failed for zstandard, falling back to pip ..."
+  pip install "zstandard>=0.22" --only-binary=:all: || pip install "zstandard>=0.22"
+fi
 elapsed
 
 if [[ "${FORCE_CUDA_TORCH}" == "1" ]]; then

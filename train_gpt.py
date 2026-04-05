@@ -1540,7 +1540,7 @@ def main() -> None:
         if args.curriculum_enabled and step < args.curriculum_steps:
             frac_c = step / max(args.curriculum_steps, 1)
             curr_seq_len = args.curriculum_min_seq_len + int((args.train_seq_len - args.curriculum_min_seq_len) * frac_c)
-            curr_seq_len = max(64, (curr_seq_len // 64) * 64)
+            curr_seq_len = 1 << int(math.log2(max(64, curr_seq_len)))
         else:
             curr_seq_len = args.train_seq_len
 
