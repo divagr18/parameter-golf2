@@ -1,0 +1,49 @@
+{
+  "tokenizers": [
+    {
+      "name": "sp1024_control",
+      "dataset_suffix": "sp1024_control",
+      "vocab_size": 1024
+    },
+    {
+      "name": "sp1024_nodigit",
+      "dataset_suffix": "sp1024_nodigit",
+      "vocab_size": 1024,
+      "trainer_overrides": {
+        "split_digits": false
+      }
+    },
+    {
+      "name": "sp1024_dummy_prefix",
+      "dataset_suffix": "sp1024_dummy_prefix",
+      "vocab_size": 1024,
+      "trainer_overrides": {
+        "add_dummy_prefix": true
+      }
+    },
+    {
+      "name": "sp1024_identity_norm",
+      "dataset_suffix": "sp1024_identity_norm",
+      "vocab_size": 1024,
+      "trainer_overrides": {
+        "normalization_rule_name": "identity"
+      }
+    },
+    {
+      "name": "sp1024_cov_hi",
+      "dataset_suffix": "sp1024_cov_hi",
+      "vocab_size": 1024,
+      "trainer_overrides": {
+        "character_coverage": 1.0
+      }
+    },
+    {
+      "name": "sp1024_cov_lo",
+      "dataset_suffix": "sp1024_cov_lo",
+      "vocab_size": 1024,
+      "trainer_overrides": {
+        "character_coverage": 0.995
+      }
+    }
+  ]
+}
