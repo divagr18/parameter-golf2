@@ -997,8 +997,12 @@ class Block(nn.Module):
         self.use_ssm = use_ssm
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.ssm = SSMMixer(dim, expand=ssm_expand, kernel_size=ssm_kernel)
+        if use_ssm:
+            self.attn = None
+            self.ssm = SSMMixer(dim, expand=ssm_expand, kernel_size=ssm_kernel)
+        else:
+            self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+            self.ssm = None
         self.mlp = MLP(dim, mlp_mult, use_swiglu=use_swiglu)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -1008,8 +1012,12 @@ class Block(nn.Module):
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         if self.use_ssm:
+            if self.ssm is None:
+                raise RuntimeError("SSM block is enabled but mixer is missing")
             mix_out = self.ssm(self.attn_norm(x))
         else:
+            if self.attn is None:
+                raise RuntimeError("Attention block is enabled but attention module is missing")
             mix_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * mix_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
