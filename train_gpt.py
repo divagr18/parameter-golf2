@@ -1542,7 +1542,7 @@ def main() -> None:
                 target_levels = 256
             else:  # int4 progressive
                 qat_elapsed = step - args.qat_start_step
-                qat_window = max(max_steps - args.qat_start_step, 1)
+                qat_window = max(args.iterations - args.qat_start_step, 1)
                 frac = qat_elapsed / qat_window
                 target_levels = 256 if frac < 0.33 else (64 if frac < 0.67 else 16)
             if CastedLinear.qat_levels != target_levels:
