@@ -90,13 +90,13 @@ elapsed
 step "3/4  Python packages  (requirements.txt + zstandard)"
 # -------------------------------------------------------------------
 log "installing requirements.txt + zstandard with uv ..."
-uv pip install -U -r requirements.txt zstandard
+uv pip install --link-mode=copy -U -r requirements.txt zstandard
 elapsed
 
 if [[ "${FORCE_CUDA_TORCH}" == "1" ]]; then
   log "installing CUDA torch==${TORCH_VERSION} from ${TORCH_INDEX_URL} with uv ..."
   log "(this downloads ~2-3 GB — uv will cache and install rapidly)"
-  uv pip install -U "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}"
+  uv pip install --link-mode=copy -U "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}"
   elapsed
 fi
 
