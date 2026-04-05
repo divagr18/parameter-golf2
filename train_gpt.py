@@ -1529,9 +1529,22 @@ def main() -> None:
                 swa_count += 1
 
         # QAT: enable fake-quantisation once model has partially converged.
-        # Triggers one torch.compile recompile at qat_start_step, then stable.
+        # int8: single stage at qat_start_step (levels=256).
+        # int4: 3-stage progressive schedule starting at qat_start_step:
+        #   stage 0 (<33% of QAT window): levels=256  (gentle, int8-equivalent)
+        #   stage 1 (33-67% of QAT window): levels=64
+        #   stage 2 (>67% of QAT window): levels=16   (true int4)
+        # Progressive avoids the catastrophic loss spike from jumping straight to 16 levels.
         if args.qat_scheme != "none":
-            target_levels = (256 if args.qat_scheme == "int8" else 16) if step >= args.qat_start_step else 0
+            if step < args.qat_start_step:
+                target_levels = 0
+            elif args.qat_scheme == "int8":
+                target_levels = 256
+            else:  # int4 progressive
+                qat_elapsed = step - args.qat_start_step
+                qat_window = max(max_steps - args.qat_start_step, 1)
+                frac = qat_elapsed / qat_window
+                target_levels = 256 if frac < 0.33 else (64 if frac < 0.67 else 16)
             if CastedLinear.qat_levels != target_levels:
                 CastedLinear.qat_levels = target_levels
                 log0(f"qat: {'enabled' if target_levels > 0 else 'disabled'} levels:{target_levels} step:{step}")
