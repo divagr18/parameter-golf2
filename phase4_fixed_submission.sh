@@ -135,6 +135,12 @@ export SHARE_FFN_ACROSS_BLOCKS="${SHARE_FFN_ACROSS_BLOCKS:-0}"
 # SwiGLU: better activation than relu² at same parameter budget
 export USE_SWIGLU="${USE_SWIGLU:-0}"
 
+# Optional hybrid SSM blocks: replace every Nth attention block with an SSM-style mixer.
+export USE_SSM="${USE_SSM:-0}"
+export SSM_EVERY_N="${SSM_EVERY_N:-2}"
+export SSM_EXPAND="${SSM_EXPAND:-2.0}"
+export SSM_KERNEL="${SSM_KERNEL:-4}"
+
 # Gradient clipping: helps stability, especially with Muon at high momentum
 export GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-1.0}"
 
@@ -192,6 +198,7 @@ echo "grad_accum:     ${GRAD_ACCUM_STEPS}"
 echo "model:          dim=${MODEL_DIM} layers=${NUM_LAYERS} heads=${NUM_HEADS} kv=${NUM_KV_HEADS} mlp_mult=${MLP_MULT}"
 echo "recurrence:     core=${RECURRENT_CORE_LAYERS} steps=${RECURRENT_STEPS}  [FIX: was 3×6]"
 echo "use_swiglu:     ${USE_SWIGLU}"
+echo "use_ssm:        ${USE_SSM} (every_n=${SSM_EVERY_N} expand=${SSM_EXPAND} kernel=${SSM_KERNEL})"
 echo "eval_stride:    ${EVAL_STRIDE_FRAC}  (sliding window eval)"
 echo "eval_seq_len:   ${EVAL_SEQ_LEN}  (0=train_seq_len)"
 echo "eval_rope_scale:${EVAL_ROPE_SCALE}"

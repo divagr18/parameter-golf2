@@ -88,6 +88,12 @@ class Hyperparameters:
     curriculum_enabled = bool(int(os.environ.get("CURRICULUM_ENABLED", "0")))
     curriculum_min_seq_len = int(os.environ.get("CURRICULUM_MIN_SEQ_LEN", "256"))
     curriculum_steps = int(os.environ.get("CURRICULUM_STEPS", "5000"))
+    # Hybrid SSM blocks (Mamba-style approximation): periodically replace attention blocks
+    # with a causal depthwise-conv gated mixer.
+    use_ssm = bool(int(os.environ.get("USE_SSM", "0")))
+    ssm_every_n = int(os.environ.get("SSM_EVERY_N", "2"))
+    ssm_expand = float(os.environ.get("SSM_EXPAND", "2.0"))
+    ssm_kernel = int(os.environ.get("SSM_KERNEL", "4"))
     # Quantization-Aware Training: fake-quantise weights during forward to teach the model
     # to tolerate quantisation noise, dramatically reducing the roundtrip BPB penalty.
     # QAT_SCHEME: "none" | "int8" | "int4"  (should match QUANT_SCHEME at export)
@@ -937,6 +943,42 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class SSMMixer(nn.Module):
+    """Lightweight causal SSM-style mixer.
+
+    This is not a full selective scan implementation, but a practical approximation
+    suitable for quick A/Bs: projected channels + causal depthwise conv + gating.
+    """
+
+    def __init__(self, dim: int, expand: float = 2.0, kernel_size: int = 4):
+        super().__init__()
+        if kernel_size < 2:
+            raise ValueError(f"SSM kernel must be >= 2, got {kernel_size}")
+        hidden = max(64, int(dim * expand) // 64 * 64)
+        self.in_proj = CastedLinear(dim, hidden * 2, bias=False)
+        # Depthwise causal conv over time (implemented via left crop after padding).
+        self.dw_conv = nn.Conv1d(
+            hidden,
+            hidden,
+            kernel_size=kernel_size,
+            groups=hidden,
+            bias=False,
+            padding=kernel_size - 1,
+        )
+        self.out_proj = CastedLinear(hidden, dim, bias=False)
+        self.out_proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [B, T, D]
+        bsz, seqlen, _ = x.shape
+        uv = self.in_proj(x)
+        u, v = uv.chunk(2, dim=-1)
+        u = F.silu(u)
+        y = self.dw_conv(u.transpose(1, 2))[..., :seqlen].transpose(1, 2).contiguous()
+        y = y * torch.sigmoid(v)
+        return self.out_proj(y)
+
+
 class Block(nn.Module):
     def __init__(
         self,
@@ -947,11 +989,16 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         use_swiglu: bool = False,
+        use_ssm: bool = False,
+        ssm_expand: float = 2.0,
+        ssm_kernel: int = 4,
     ):
         super().__init__()
+        self.use_ssm = use_ssm
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.ssm = SSMMixer(dim, expand=ssm_expand, kernel_size=ssm_kernel)
         self.mlp = MLP(dim, mlp_mult, use_swiglu=use_swiglu)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -960,8 +1007,11 @@ class Block(nn.Module):
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        if self.use_ssm:
+            mix_out = self.ssm(self.attn_norm(x))
+        else:
+            mix_out = self.attn(self.attn_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * mix_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
@@ -985,6 +1035,10 @@ class GPT(nn.Module):
         share_ffn_across_blocks: bool = False,
         use_swiglu: bool = False,
         bigram_rank: int = 0,
+        use_ssm: bool = False,
+        ssm_every_n: int = 2,
+        ssm_expand: float = 2.0,
+        ssm_kernel: int = 4,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1001,9 +1055,17 @@ class GPT(nn.Module):
         self.recurrent_core_layers = recurrent_core_layers
         self.recurrent_steps = recurrent_steps
         self.share_ffn_across_blocks = share_ffn_across_blocks
+        self.use_ssm = use_ssm
+        self.ssm_every_n = ssm_every_n
+        self.ssm_expand = ssm_expand
+        self.ssm_kernel = ssm_kernel
         self.total_effective_layers = (
             recurrent_core_layers * recurrent_steps if self.use_recurrence else num_layers
         )
+
+        def is_ssm_block(idx: int) -> bool:
+            return self.use_ssm and self.ssm_every_n > 0 and ((idx + 1) % self.ssm_every_n == 0)
+
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         if self.use_recurrence:
             self.num_encoder_layers = 0
@@ -1022,8 +1084,11 @@ class GPT(nn.Module):
                         rope_base,
                         qk_gain_init,
                         use_swiglu=use_swiglu,
+                        use_ssm=is_ssm_block(i),
+                        ssm_expand=ssm_expand,
+                        ssm_kernel=ssm_kernel,
                     )
-                    for _ in range(recurrent_core_layers)
+                    for i in range(recurrent_core_layers)
                 ]
             )
             if share_ffn_across_blocks and len(self.blocks) > 1:
@@ -1045,10 +1110,15 @@ class GPT(nn.Module):
                         rope_base,
                         qk_gain_init,
                         use_swiglu=use_swiglu,
+                        use_ssm=is_ssm_block(i),
+                        ssm_expand=ssm_expand,
+                        ssm_kernel=ssm_kernel,
                     )
-                    for _ in range(num_layers)
+                    for i in range(num_layers)
                 ]
             )
+        self.num_ssm_blocks = sum(1 for block in self.blocks if block.use_ssm)
+        self.num_attn_blocks = len(self.blocks) - self.num_ssm_blocks
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -1300,6 +1370,10 @@ def main() -> None:
         share_ffn_across_blocks=args.share_ffn_across_blocks,
         use_swiglu=args.use_swiglu,
         bigram_rank=args.bigram_rank,
+        use_ssm=args.use_ssm,
+        ssm_every_n=args.ssm_every_n,
+        ssm_expand=args.ssm_expand,
+        ssm_kernel=args.ssm_kernel,
     ).to(device=device, dtype=torch.bfloat16 if autocast_enabled else torch.float32)
     if autocast_enabled:
         for module in base_model.modules():
@@ -1375,18 +1449,25 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"sdp_backends:{sdp_backends_log}")
-    log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} use_swiglu:{args.use_swiglu} qat_scheme:{args.qat_scheme} qat_start_step:{args.qat_start_step}")
+    log0(
+        f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads} "
+        f"use_swiglu:{args.use_swiglu} use_ssm:{args.use_ssm} ssm_every_n:{args.ssm_every_n} "
+        f"ssm_expand:{args.ssm_expand} ssm_kernel:{args.ssm_kernel} "
+        f"qat_scheme:{args.qat_scheme} qat_start_step:{args.qat_start_step}"
+    )
     if base_model.use_recurrence:
         log0(
             f"architecture:recurrent core_layers:{base_model.recurrent_core_layers} "
             f"recurrent_steps:{base_model.recurrent_steps} "
             f"effective_layers:{base_model.total_effective_layers} "
+            f"ssm_blocks:{base_model.num_ssm_blocks} attn_blocks:{base_model.num_attn_blocks} "
             f"share_ffn_across_blocks:{base_model.share_ffn_across_blocks}"
         )
     else:
         log0(
             f"architecture:stacked num_layers:{args.num_layers} "
-            f"encoder_layers:{base_model.num_encoder_layers} decoder_layers:{base_model.num_decoder_layers}"
+            f"encoder_layers:{base_model.num_encoder_layers} decoder_layers:{base_model.num_decoder_layers} "
+            f"ssm_blocks:{base_model.num_ssm_blocks} attn_blocks:{base_model.num_attn_blocks}"
         )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
