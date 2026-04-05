@@ -1167,11 +1167,15 @@ class GPT(nn.Module):
                 self.mtp_heads = None
             else:
                 self.mtp_heads = nn.ModuleList([CastedLinear(model_dim, vocab_size, bias=False) for _ in range(self.mtp_steps)])
-            self.mtp_step_weights = [self.mtp_decay**i for i in range(self.mtp_steps)]
+            self.register_buffer(
+                "mtp_step_weights",
+                torch.tensor([self.mtp_decay**i for i in range(self.mtp_steps)], dtype=torch.float32),
+                persistent=False,
+            )
         else:
             self.mtp_branches = None
             self.mtp_heads = None
-            self.mtp_step_weights = []
+            self.register_buffer("mtp_step_weights", torch.zeros((0,), dtype=torch.float32), persistent=False)
         # Low-rank bigram logit bias.  At position i, adds bigram_right(bigram_left(input[i])) to logits.
         # This gives the model a cheap, learned n-gram prior on top of the contextual representations.
         self.bigram_rank = bigram_rank
@@ -1235,7 +1239,7 @@ class GPT(nn.Module):
 
         _, seqlen = target_ids.shape
         weighted_aux = torch.zeros((), device=base_loss.device, dtype=base_loss.dtype)
-        weight_sum = 0.0
+        weight_sum = torch.zeros((), device=base_loss.device, dtype=base_loss.dtype)
         if self.mtp_branches is not None:
             for step_idx in range(self.mtp_steps):
                 horizon = step_idx + 1  # 1 predicts token at t+2, 2 predicts t+3, ...
@@ -1250,11 +1254,11 @@ class GPT(nn.Module):
                     aux_logits_proj = self.mtp_heads[step_idx](branch_flat_h)
                 aux_logits = self.logit_softcap * torch.tanh(aux_logits_proj / self.logit_softcap)
                 aux_loss = F.cross_entropy(aux_logits.float(), future_targets, reduction="mean")
-                w = float(self.mtp_step_weights[step_idx]) if step_idx < len(self.mtp_step_weights) else 1.0
+                w = self.mtp_step_weights[step_idx].to(dtype=weighted_aux.dtype)
                 weighted_aux = weighted_aux + aux_loss.to(weighted_aux.dtype) * w
-                weight_sum += w
+                weight_sum = weight_sum + w
 
-        if weight_sum <= 0.0:
+        if torch.le(weight_sum, 0).item():
             return base_loss
         aux_loss = weighted_aux / weight_sum
         return base_loss + self.mtp_weight * aux_loss
