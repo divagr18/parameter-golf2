@@ -40,7 +40,7 @@ log "torch_version=${TORCH_VERSION}  index_url=${TORCH_INDEX_URL}"
 log "fineweb_variant=${FINEWEB_VARIANT}  train_shards=${TRAIN_SHARDS}  install_data=${INSTALL_DATA}"
 
 # -------------------------------------------------------------------
-step "1/5  Python check"
+step "1/4  Python & UV check"
 # -------------------------------------------------------------------
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "Python not found: ${PYTHON_BIN}" >&2
@@ -48,45 +48,55 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
 fi
 log "found $(${PYTHON_BIN} --version 2>&1) at $(command -v ${PYTHON_BIN})"
 
-# -------------------------------------------------------------------
-step "2/5  Virtualenv"
-# -------------------------------------------------------------------
-if [[ ! -d "${VENV_DIR}" ]]; then
-  log "creating virtualenv at ${VENV_DIR} ..."
-  "${PYTHON_BIN}" -m venv "${VENV_DIR}"
-  log "virtualenv created"
+if command -v uv >/dev/null 2>&1; then
+  log "found $(uv --version 2>&1) at $(command -v uv)"
 else
-  log "virtualenv already exists at ${VENV_DIR}, reusing"
+  log "uv not found globally. Will install locally in virtualenv."
+fi
+
+# -------------------------------------------------------------------
+step "2/4  Virtualenv & uv install"
+# -------------------------------------------------------------------
+if command -v uv >/dev/null 2>&1; then
+  if [[ ! -d "${VENV_DIR}" ]]; then
+    log "creating virtualenv at ${VENV_DIR} with uv ..."
+    uv venv "${VENV_DIR}" --python "${PYTHON_BIN}"
+    log "virtualenv created"
+  else
+    log "virtualenv already exists at ${VENV_DIR}, reusing"
+  fi
+else
+  if [[ ! -d "${VENV_DIR}" ]]; then
+    log "creating virtualenv at ${VENV_DIR} with standard venv ..."
+    "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+    log "virtualenv created"
+  else
+    log "virtualenv already exists at ${VENV_DIR}, reusing"
+  fi
 fi
 
 # shellcheck disable=SC1090
 source "${VENV_DIR}/bin/activate"
 log "activated: $(python --version 2>&1)"
 
-# -------------------------------------------------------------------
-step "3/5  pip / base tools"
-# -------------------------------------------------------------------
-log "upgrading pip, setuptools, wheel ..."
-python -m pip install --upgrade pip setuptools wheel 2>&1 | \
-  grep -E --line-buffered '(Collecting|Downloading|Installing|Successfully|already)' | \
-  while IFS= read -r line; do log "  pip: ${line}"; done
+if ! command -v uv >/dev/null 2>&1; then
+  log "installing uv in virtualenv ..."
+  python -m pip install -q uv
+fi
+log "using $(uv --version 2>&1)"
 elapsed
 
 # -------------------------------------------------------------------
-step "4/5  Python packages  (requirements.txt + zstandard)"
+step "3/4  Python packages  (requirements.txt + zstandard)"
 # -------------------------------------------------------------------
-log "installing requirements.txt + zstandard ..."
-python -m pip install --upgrade -r requirements.txt zstandard 2>&1 | \
-  grep -E --line-buffered '(Collecting|Downloading|Installing|Successfully|already|WARNING|ERROR)' | \
-  while IFS= read -r line; do log "  pip: ${line}"; done
+log "installing requirements.txt + zstandard with uv ..."
+uv pip install -U -r requirements.txt zstandard
 elapsed
 
 if [[ "${FORCE_CUDA_TORCH}" == "1" ]]; then
-  log "installing CUDA torch==${TORCH_VERSION} from ${TORCH_INDEX_URL} ..."
-  log "(this downloads ~2-3 GB — may take several minutes on first run)"
-  python -m pip install --upgrade "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}" 2>&1 | \
-    grep -E --line-buffered '(Collecting|Downloading|Installing|Successfully|already|WARNING|ERROR|MB|%|kB)' | \
-    while IFS= read -r line; do log "  pip: ${line}"; done
+  log "installing CUDA torch==${TORCH_VERSION} from ${TORCH_INDEX_URL} with uv ..."
+  log "(this downloads ~2-3 GB — uv will cache and install rapidly)"
+  uv pip install -U "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}"
   elapsed
 fi
 
@@ -116,7 +126,7 @@ PY
 elapsed
 
 # -------------------------------------------------------------------
-step "5/5  FineWeb dataset download"
+step "4/4  FineWeb dataset download"
 # -------------------------------------------------------------------
 if [[ "${INSTALL_DATA}" == "1" ]]; then
   DATA_DIR="./data/datasets/fineweb10B_${FINEWEB_VARIANT}"
