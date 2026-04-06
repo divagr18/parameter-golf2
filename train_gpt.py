@@ -1851,7 +1851,9 @@ def main() -> None:
             teacher_logits: Tensor | None = None
             token_weights: Tensor | None = None
             if distill_active and ema_teacher is not None:
-                with torch.inference_mode():
+                # Use no_grad (not inference_mode) because inference tensors can error when
+                # downstream ops save them for backward (e.g., KL in distillation under compile).
+                with torch.no_grad():
                     teacher_logits = ema_teacher.forward_logits(x).detach()
             if args.byte_weighted_loss_enabled:
                 with torch.no_grad():
