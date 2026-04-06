@@ -1255,11 +1255,11 @@ class GPT(nn.Module):
             return None
         return self.residual_ngram_scale * ngram_logits
 
-    def _compose_output_logits(self, logits_proj: Tensor, input_ids: Tensor, flat_h: Tensor) -> Tensor:
+    def _compose_output_logits(self, logits_proj: Tensor, input_ids: Tensor, flat_h: Tensor) -> tuple[Tensor, bool]:
         neural_logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         ngram_logits = self._compute_residual_ngram_logits(input_ids)
         if ngram_logits is None:
-            return neural_logits
+            return neural_logits, False
 
         gate = torch.sigmoid(self.residual_ngram_gate(flat_h).float()).clamp(min=1e-4, max=1.0 - 1e-4)
         neural_log_probs = F.log_softmax(neural_logits.float(), dim=-1)
@@ -1268,7 +1268,7 @@ class GPT(nn.Module):
             torch.log1p(-gate) + neural_log_probs,
             torch.log(gate) + ngram_log_probs,
         )
-        return mixed_log_probs.to(dtype=neural_logits.dtype)
+        return mixed_log_probs.to(dtype=neural_logits.dtype), True
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1299,7 +1299,8 @@ class GPT(nn.Module):
         if self.bigram_rank > 0:
             bg = self.bigram_right(self.bigram_left(input_ids.reshape(-1)))  # [B*T, vocab]
             logits_proj = logits_proj + self.bigram_scale * bg
-        return self._compose_output_logits(logits_proj, input_ids, flat_h)
+        logits, _ = self._compose_output_logits(logits_proj, input_ids, flat_h)
+        return logits
 
     def forward(
         self,
@@ -1343,8 +1344,11 @@ class GPT(nn.Module):
         if self.bigram_rank > 0:
             bg = self.bigram_right(self.bigram_left(input_ids.reshape(-1)))  # [B*T, vocab]
             logits_proj = logits_proj + self.bigram_scale * bg
-        logits = self._compose_output_logits(logits_proj, input_ids, flat_h)
-        base_per_token = F.cross_entropy(logits.float(), targets, reduction="none")  # [B*T]
+        logits, logits_are_log_probs = self._compose_output_logits(logits_proj, input_ids, flat_h)
+        if logits_are_log_probs:
+            base_per_token = F.nll_loss(logits.float(), targets, reduction="none")  # [B*T]
+        else:
+            base_per_token = F.cross_entropy(logits.float(), targets, reduction="none")  # [B*T]
         weighted = base_per_token
         norm = torch.ones((), device=base_per_token.device, dtype=base_per_token.dtype) * base_per_token.numel()
         if per_token_weights is not None:
@@ -1367,17 +1371,23 @@ class GPT(nn.Module):
 
         if distill_teacher_logits is not None and distill_weight > 0.0:
             temp = max(float(distill_temp), 1e-4)
-            student = (logits.float() / temp)
-            teacher = (distill_teacher_logits.float() / temp)
+            if logits_are_log_probs:
+                student_log_probs = logits.float()
+                teacher_probs = distill_teacher_logits.float().exp()
+            else:
+                student = (logits.float() / temp)
+                teacher = (distill_teacher_logits.float() / temp)
+                student_log_probs = F.log_softmax(student, dim=-1)
+                teacher_probs = F.softmax(teacher, dim=-1)
             if loss_mask is not None:
                 mask = loss_mask.reshape(-1) > 0
-                student = student[mask]
-                teacher = teacher[mask]
+                student_log_probs = student_log_probs[mask]
+                teacher_probs = teacher_probs[mask]
             kl = F.kl_div(
-                F.log_softmax(student, dim=-1),
-                F.softmax(teacher, dim=-1),
+                student_log_probs,
+                teacher_probs,
                 reduction="batchmean",
-            ) * (temp * temp)
+            ) * (temp * temp if not logits_are_log_probs else 1.0)
             total_loss = total_loss + float(distill_weight) * kl
 
         # Keep eval metric comparable by applying MTP only when loss_mask is not provided.
