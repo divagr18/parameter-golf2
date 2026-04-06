@@ -1258,9 +1258,7 @@ class GPT(nn.Module):
                 weighted_aux = weighted_aux + aux_loss.to(weighted_aux.dtype) * w
                 weight_sum = weight_sum + w
 
-        if torch.le(weight_sum, 0).item():
-            return base_loss
-        aux_loss = weighted_aux / weight_sum
+        aux_loss = weighted_aux / weight_sum.clamp_min(1e-12)
         return base_loss + self.mtp_weight * aux_loss
 
 
