@@ -95,6 +95,14 @@ class Hyperparameters:
     mtp_decay = float(os.environ.get("MTP_DECAY", "1.0"))
     mtp_tie_embeddings = bool(int(os.environ.get("MTP_TIE_EMBEDDINGS", "1")))
     mtp_lr = float(os.environ.get("MTP_LR", "0.02"))
+    # On-the-fly distillation (EMA teacher) in the late training tail.
+    distill_enabled = bool(int(os.environ.get("DISTILL_ENABLED", "0")))
+    distill_start_frac = float(os.environ.get("DISTILL_START_FRAC", "0.7"))
+    distill_weight = float(os.environ.get("DISTILL_WEIGHT", "0.1"))
+    distill_temp = float(os.environ.get("DISTILL_TEMP", "1.5"))
+    distill_ema_decay = float(os.environ.get("DISTILL_EMA_DECAY", "0.999"))
+    # Logit range regularization on pre-softcap logits for quantization robustness.
+    logit_reg_weight = float(os.environ.get("LOGIT_REG_WEIGHT", "0.0"))
     # Hybrid SSM blocks (Mamba-style approximation): periodically replace attention blocks
     # with a causal depthwise-conv gated mixer.
     use_ssm = bool(int(os.environ.get("USE_SSM", "0")))
@@ -1193,7 +1201,47 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor, loss_mask: Tensor | None = None) -> Tensor:
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        if self.use_recurrence:
+            for _ in range(self.recurrent_steps):
+                for block in self.blocks:
+                    x = block(x, x0)
+        else:
+            skips: list[Tensor] = []
+            # First half stores skips; second half reuses them in reverse order.
+            for i in range(self.num_encoder_layers):
+                x = self.blocks[i](x, x0)
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                x = self.blocks[self.num_encoder_layers + i](x, x0)
+
+        flat_h = self.final_norm(x).reshape(-1, x.size(-1))
+        if self.tie_embeddings:
+            logits_proj = F.linear(flat_h, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(flat_h)
+        if self.bigram_rank > 0:
+            bg = self.bigram_right(self.bigram_left(input_ids.reshape(-1)))  # [B*T, vocab]
+            logits_proj = logits_proj + self.bigram_scale * bg
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        target_ids: Tensor,
+        loss_mask: Tensor | None = None,
+        distill_teacher_logits: Tensor | None = None,
+        distill_weight: float = 0.0,
+        distill_temp: float = 1.0,
+        logit_reg_weight: float = 0.0,
+    ) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -1233,9 +1281,29 @@ class GPT(nn.Module):
         else:
             base_loss = base_per_token.mean()
 
+        total_loss = base_loss
+
+        if logit_reg_weight > 0.0:
+            total_loss = total_loss + float(logit_reg_weight) * logits_proj.float().pow(2).mean()
+
+        if distill_teacher_logits is not None and distill_weight > 0.0:
+            temp = max(float(distill_temp), 1e-4)
+            student = (logits.float() / temp)
+            teacher = (distill_teacher_logits.float() / temp)
+            if loss_mask is not None:
+                mask = loss_mask.reshape(-1) > 0
+                student = student[mask]
+                teacher = teacher[mask]
+            kl = F.kl_div(
+                F.log_softmax(student, dim=-1),
+                F.softmax(teacher, dim=-1),
+                reduction="batchmean",
+            ) * (temp * temp)
+            total_loss = total_loss + float(distill_weight) * kl
+
         # Keep eval metric comparable by applying MTP only when loss_mask is not provided.
         if not self.mtp_enabled or self.mtp_weight <= 0.0 or loss_mask is not None:
-            return base_loss
+            return total_loss
 
         _, seqlen = target_ids.shape
         weighted_aux = torch.zeros((), device=base_loss.device, dtype=base_loss.dtype)
@@ -1259,7 +1327,7 @@ class GPT(nn.Module):
                 weight_sum = weight_sum + w
 
         aux_loss = weighted_aux / weight_sum.clamp_min(1e-12)
-        return base_loss + self.mtp_weight * aux_loss
+        return total_loss + self.mtp_weight * aux_loss
 
 
 # -----------------------------
@@ -1558,6 +1626,9 @@ def main() -> None:
         f"ssm_expand:{args.ssm_expand} ssm_kernel:{args.ssm_kernel} "
         f"mtp_enabled:{args.mtp_enabled} mtp_steps:{args.mtp_steps} mtp_weight:{args.mtp_weight} "
         f"mtp_decay:{args.mtp_decay} mtp_tie_embeddings:{args.mtp_tie_embeddings} "
+        f"distill_enabled:{args.distill_enabled} distill_start_frac:{args.distill_start_frac} "
+        f"distill_weight:{args.distill_weight} distill_temp:{args.distill_temp} distill_ema_decay:{args.distill_ema_decay} "
+        f"logit_reg_weight:{args.logit_reg_weight} "
         f"qat_scheme:{args.qat_scheme} qat_start_step:{args.qat_start_step}"
     )
     if base_model.use_recurrence:
@@ -1639,6 +1710,14 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    distill_start_step = int(max(0.0, min(1.0, args.distill_start_frac)) * args.iterations)
+    ema_teacher: GPT | None = None
+    if args.distill_enabled and args.distill_weight > 0.0:
+        ema_teacher = copy.deepcopy(base_model)
+        ema_teacher.eval()
+        for p in ema_teacher.parameters():
+            p.requires_grad_(False)
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -1743,17 +1822,41 @@ def main() -> None:
         else:
             curr_seq_len = args.train_seq_len
 
+        distill_active = (
+            ema_teacher is not None
+            and step >= distill_start_step
+            and args.distill_weight > 0.0
+        )
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, curr_seq_len, grad_accum_steps)
+            teacher_logits: Tensor | None = None
+            if distill_active and ema_teacher is not None:
+                with torch.inference_mode():
+                    teacher_logits = ema_teacher.forward_logits(x).detach()
             if autocast_enabled:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    loss = model(x, y)
+                    loss = model(
+                        x,
+                        y,
+                        distill_teacher_logits=teacher_logits,
+                        distill_weight=args.distill_weight if distill_active else 0.0,
+                        distill_temp=args.distill_temp,
+                        logit_reg_weight=args.logit_reg_weight,
+                    )
             else:
-                loss = model(x, y)
+                loss = model(
+                    x,
+                    y,
+                    distill_teacher_logits=teacher_logits,
+                    distill_weight=args.distill_weight if distill_active else 0.0,
+                    distill_temp=args.distill_temp,
+                    logit_reg_weight=args.logit_reg_weight,
+                )
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1771,6 +1874,11 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
         for opt in optimizers:
             opt.step()
+        if ema_teacher is not None:
+            with torch.no_grad():
+                decay = float(args.distill_ema_decay)
+                for p_t, p_s in zip(ema_teacher.parameters(), base_model.parameters(), strict=True):
+                    p_t.mul_(decay).add_(p_s, alpha=1.0 - decay)
         zero_grad_all()
 
         step += 1
