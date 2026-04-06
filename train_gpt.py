@@ -78,6 +78,14 @@ class Hyperparameters:
     # 0 = disabled.  32 costs ~64K int8 params (≈32 KB), well within the 164 KB headroom.
     bigram_rank = int(os.environ.get("BIGRAM_RANK", "0"))
     bigram_lr = float(os.environ.get("BIGRAM_LR", "0.04"))
+    # Residual n-gram modeling: mix neural logits with a lightweight n-gram baseline.
+    # total_prob = (1-gate)*P_neural + gate*P_ngram, where gate is learned per token.
+    # This lets the transformer focus more capacity on hard residual structure.
+    residual_ngram_enabled = bool(int(os.environ.get("RESIDUAL_NGRAM_ENABLED", "0")))
+    residual_bigram_rank = int(os.environ.get("RESIDUAL_BIGRAM_RANK", "0"))
+    residual_trigram_rank = int(os.environ.get("RESIDUAL_TRIGRAM_RANK", "0"))
+    residual_ngram_lr = float(os.environ.get("RESIDUAL_NGRAM_LR", "0.04"))
+    residual_ngram_mix_init = float(os.environ.get("RESIDUAL_NGRAM_MIX_INIT", "-2.5"))
     # Stochastic Weight Averaging: average weights during the warmdown phase.
     # Takes the mean of snapshots every SWA_COLLECT_EVERY steps once LR starts decaying.
     # Research-confirmed ~0.5-1.5% BPB improvement, especially helps quantization quality.
@@ -1083,6 +1091,10 @@ class GPT(nn.Module):
         ssm_every_n: int = 2,
         ssm_expand: float = 2.0,
         ssm_kernel: int = 4,
+        residual_ngram_enabled: bool = False,
+        residual_bigram_rank: int = 0,
+        residual_trigram_rank: int = 0,
+        residual_ngram_mix_init: float = -2.5,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1108,6 +1120,12 @@ class GPT(nn.Module):
         self.mtp_weight = max(0.0, mtp_weight)
         self.mtp_decay = mtp_decay
         self.mtp_tie_embeddings = mtp_tie_embeddings
+        self.residual_bigram_rank = max(0, residual_bigram_rank)
+        self.residual_trigram_rank = max(0, residual_trigram_rank)
+        self.residual_ngram_enabled = residual_ngram_enabled and (
+            self.residual_bigram_rank > 0 or self.residual_trigram_rank > 0
+        )
+        self.residual_ngram_mix_init = residual_ngram_mix_init
         self.total_effective_layers = (
             recurrent_core_layers * recurrent_steps if self.use_recurrence else num_layers
         )
@@ -1195,7 +1213,23 @@ class GPT(nn.Module):
             self.bigram_right = CastedLinear(bigram_rank, vocab_size, bias=False)
             self.bigram_right._zero_init = True   # starts contributing nothing; learns when useful
             self.bigram_scale = nn.Parameter(torch.ones(1, dtype=torch.float32))
+        if self.residual_ngram_enabled:
+            if self.residual_bigram_rank > 0:
+                self.residual_bigram_left = nn.Embedding(vocab_size, self.residual_bigram_rank)
+                self.residual_bigram_right = CastedLinear(self.residual_bigram_rank, vocab_size, bias=False)
+                self.residual_bigram_right._zero_init = True
+            if self.residual_trigram_rank > 0:
+                self.residual_trigram_prev1 = nn.Embedding(vocab_size, self.residual_trigram_rank)
+                self.residual_trigram_prev2 = nn.Embedding(vocab_size, self.residual_trigram_rank)
+                self.residual_trigram_right = CastedLinear(self.residual_trigram_rank, vocab_size, bias=False)
+                self.residual_trigram_right._zero_init = True
+            self.residual_ngram_scale = nn.Parameter(torch.ones(1, dtype=torch.float32))
+            self.residual_ngram_gate = CastedLinear(model_dim, 1, bias=True)
         self._init_weights()
+        if self.residual_ngram_enabled:
+            nn.init.zeros_(self.residual_ngram_gate.weight)
+            if self.residual_ngram_gate.bias is not None:
+                nn.init.constant_(self.residual_ngram_gate.bias, self.residual_ngram_mix_init)
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -1203,6 +1237,38 @@ class GPT(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+
+    def _compute_residual_ngram_logits(self, input_ids: Tensor) -> Tensor | None:
+        if not self.residual_ngram_enabled:
+            return None
+        prev1 = input_ids.reshape(-1)
+        ngram_logits: Tensor | None = None
+        if self.residual_bigram_rank > 0:
+            bg = self.residual_bigram_right(self.residual_bigram_left(prev1))
+            ngram_logits = bg
+        if self.residual_trigram_rank > 0:
+            prev2_ids = torch.cat((input_ids[:, :1], input_ids[:, :-1]), dim=1).reshape(-1)
+            tri_feat = self.residual_trigram_prev1(prev1) * self.residual_trigram_prev2(prev2_ids)
+            tri = self.residual_trigram_right(tri_feat)
+            ngram_logits = tri if ngram_logits is None else (ngram_logits + tri)
+        if ngram_logits is None:
+            return None
+        return self.residual_ngram_scale * ngram_logits
+
+    def _compose_output_logits(self, logits_proj: Tensor, input_ids: Tensor, flat_h: Tensor) -> Tensor:
+        neural_logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        ngram_logits = self._compute_residual_ngram_logits(input_ids)
+        if ngram_logits is None:
+            return neural_logits
+
+        gate = torch.sigmoid(self.residual_ngram_gate(flat_h).float()).clamp(min=1e-4, max=1.0 - 1e-4)
+        neural_log_probs = F.log_softmax(neural_logits.float(), dim=-1)
+        ngram_log_probs = F.log_softmax(ngram_logits.float(), dim=-1)
+        mixed_log_probs = torch.logaddexp(
+            torch.log1p(-gate) + neural_log_probs,
+            torch.log(gate) + ngram_log_probs,
+        )
+        return mixed_log_probs.to(dtype=neural_logits.dtype)
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1233,7 +1299,7 @@ class GPT(nn.Module):
         if self.bigram_rank > 0:
             bg = self.bigram_right(self.bigram_left(input_ids.reshape(-1)))  # [B*T, vocab]
             logits_proj = logits_proj + self.bigram_scale * bg
-        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return self._compose_output_logits(logits_proj, input_ids, flat_h)
 
     def forward(
         self,
@@ -1277,7 +1343,7 @@ class GPT(nn.Module):
         if self.bigram_rank > 0:
             bg = self.bigram_right(self.bigram_left(input_ids.reshape(-1)))  # [B*T, vocab]
             logits_proj = logits_proj + self.bigram_scale * bg
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        logits = self._compose_output_logits(logits_proj, input_ids, flat_h)
         base_per_token = F.cross_entropy(logits.float(), targets, reduction="none")  # [B*T]
         weighted = base_per_token
         norm = torch.ones((), device=base_per_token.device, dtype=base_per_token.dtype) * base_per_token.numel()
@@ -1543,6 +1609,10 @@ def main() -> None:
         ssm_every_n=args.ssm_every_n,
         ssm_expand=args.ssm_expand,
         ssm_kernel=args.ssm_kernel,
+        residual_ngram_enabled=args.residual_ngram_enabled,
+        residual_bigram_rank=args.residual_bigram_rank,
+        residual_trigram_rank=args.residual_trigram_rank,
+        residual_ngram_mix_init=args.residual_ngram_mix_init,
     ).to(device=device, dtype=torch.bfloat16 if autocast_enabled else torch.float32)
     if autocast_enabled:
         for module in base_model.modules():
@@ -1605,6 +1675,30 @@ def main() -> None:
             fused=autocast_enabled,
         )
         optimizers.append(optimizer_bigram)
+    if args.residual_ngram_enabled and getattr(base_model, "residual_ngram_enabled", False):
+        residual_params: list[nn.Parameter] = [
+            base_model.residual_ngram_scale,
+            base_model.residual_ngram_gate.weight,
+        ]
+        if base_model.residual_ngram_gate.bias is not None:
+            residual_params.append(base_model.residual_ngram_gate.bias)
+        if base_model.residual_bigram_rank > 0:
+            residual_params.extend([base_model.residual_bigram_left.weight, base_model.residual_bigram_right.weight])
+        if base_model.residual_trigram_rank > 0:
+            residual_params.extend(
+                [
+                    base_model.residual_trigram_prev1.weight,
+                    base_model.residual_trigram_prev2.weight,
+                    base_model.residual_trigram_right.weight,
+                ]
+            )
+        optimizer_residual = torch.optim.Adam(
+            [{"params": residual_params, "lr": args.residual_ngram_lr, "base_lr": args.residual_ngram_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=autocast_enabled,
+        )
+        optimizers.append(optimizer_residual)
     if args.mtp_enabled and base_model.mtp_branches is not None:
         mtp_params: list[nn.Parameter] = []
         for branch in base_model.mtp_branches:
@@ -1643,6 +1737,9 @@ def main() -> None:
         f"distill_weight:{args.distill_weight} distill_temp:{args.distill_temp} distill_ema_decay:{args.distill_ema_decay} "
         f"logit_reg_weight:{args.logit_reg_weight} byte_weighted_loss:{args.byte_weighted_loss_enabled} "
         f"byte_weighted_loss_alpha:{args.byte_weighted_loss_alpha} "
+        f"residual_ngram_enabled:{args.residual_ngram_enabled} residual_bigram_rank:{args.residual_bigram_rank} "
+        f"residual_trigram_rank:{args.residual_trigram_rank} residual_ngram_lr:{args.residual_ngram_lr} "
+        f"residual_ngram_mix_init:{args.residual_ngram_mix_init} "
         f"qat_scheme:{args.qat_scheme} qat_start_step:{args.qat_start_step}"
     )
     if base_model.use_recurrence:
