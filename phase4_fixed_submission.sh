@@ -156,6 +156,8 @@ export DISTILL_WEIGHT="${DISTILL_WEIGHT:-0.1}"
 export DISTILL_TEMP="${DISTILL_TEMP:-1.5}"
 export DISTILL_EMA_DECAY="${DISTILL_EMA_DECAY:-0.999}"
 export LOGIT_REG_WEIGHT="${LOGIT_REG_WEIGHT:-0.0}"
+export BYTE_WEIGHTED_LOSS_ENABLED="${BYTE_WEIGHTED_LOSS_ENABLED:-0}"
+export BYTE_WEIGHTED_LOSS_ALPHA="${BYTE_WEIGHTED_LOSS_ALPHA:-1.0}"
 
 # Gradient clipping: helps stability, especially with Muon at high momentum
 export GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-1.0}"
@@ -218,6 +220,7 @@ echo "use_ssm:        ${USE_SSM} (every_n=${SSM_EVERY_N} expand=${SSM_EXPAND} ke
 echo "use_mtp:        ${MTP_ENABLED} (steps=${MTP_STEPS} weight=${MTP_WEIGHT} decay=${MTP_DECAY} tie=${MTP_TIE_EMBEDDINGS} lr=${MTP_LR})"
 echo "distill:        ${DISTILL_ENABLED} (start_frac=${DISTILL_START_FRAC} weight=${DISTILL_WEIGHT} temp=${DISTILL_TEMP} ema=${DISTILL_EMA_DECAY})"
 echo "logit_reg_w:    ${LOGIT_REG_WEIGHT}"
+echo "byte_loss:      ${BYTE_WEIGHTED_LOSS_ENABLED} (alpha=${BYTE_WEIGHTED_LOSS_ALPHA})"
 echo "eval_stride:    ${EVAL_STRIDE_FRAC}  (sliding window eval)"
 echo "eval_seq_len:   ${EVAL_SEQ_LEN}  (0=train_seq_len)"
 echo "eval_rope_scale:${EVAL_ROPE_SCALE}"

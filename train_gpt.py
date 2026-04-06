@@ -103,6 +103,9 @@ class Hyperparameters:
     distill_ema_decay = float(os.environ.get("DISTILL_EMA_DECAY", "0.999"))
     # Logit range regularization on pre-softcap logits for quantization robustness.
     logit_reg_weight = float(os.environ.get("LOGIT_REG_WEIGHT", "0.0"))
+    # Byte-weighted training loss (align objective closer to tokenizer-agnostic BPB).
+    byte_weighted_loss_enabled = bool(int(os.environ.get("BYTE_WEIGHTED_LOSS_ENABLED", "0")))
+    byte_weighted_loss_alpha = float(os.environ.get("BYTE_WEIGHTED_LOSS_ALPHA", "1.0"))
     # Hybrid SSM blocks (Mamba-style approximation): periodically replace attention blocks
     # with a causal depthwise-conv gated mixer.
     use_ssm = bool(int(os.environ.get("USE_SSM", "0")))
@@ -1237,6 +1240,7 @@ class GPT(nn.Module):
         input_ids: Tensor,
         target_ids: Tensor,
         loss_mask: Tensor | None = None,
+        per_token_weights: Tensor | None = None,
         distill_teacher_logits: Tensor | None = None,
         distill_weight: float = 0.0,
         distill_temp: float = 1.0,
@@ -1275,11 +1279,20 @@ class GPT(nn.Module):
             logits_proj = logits_proj + self.bigram_scale * bg
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         base_per_token = F.cross_entropy(logits.float(), targets, reduction="none")  # [B*T]
+        weighted = base_per_token
+        norm = torch.ones((), device=base_per_token.device, dtype=base_per_token.dtype) * base_per_token.numel()
+        if per_token_weights is not None:
+            token_w = per_token_weights.reshape(-1).to(base_per_token.dtype)
+            weighted = weighted * token_w
+            norm = token_w.sum().clamp(min=1)
         if loss_mask is not None:
             mask = loss_mask.reshape(-1).to(base_per_token.dtype)
-            base_loss = (base_per_token * mask).sum() / mask.sum().clamp(min=1)
-        else:
-            base_loss = base_per_token.mean()
+            weighted = weighted * mask
+            if per_token_weights is None:
+                norm = mask.sum().clamp(min=1)
+            else:
+                norm = (token_w * mask).sum().clamp(min=1)
+        base_loss = weighted.sum() / norm
 
         total_loss = base_loss
 
@@ -1628,7 +1641,8 @@ def main() -> None:
         f"mtp_decay:{args.mtp_decay} mtp_tie_embeddings:{args.mtp_tie_embeddings} "
         f"distill_enabled:{args.distill_enabled} distill_start_frac:{args.distill_start_frac} "
         f"distill_weight:{args.distill_weight} distill_temp:{args.distill_temp} distill_ema_decay:{args.distill_ema_decay} "
-        f"logit_reg_weight:{args.logit_reg_weight} "
+        f"logit_reg_weight:{args.logit_reg_weight} byte_weighted_loss:{args.byte_weighted_loss_enabled} "
+        f"byte_weighted_loss_alpha:{args.byte_weighted_loss_alpha} "
         f"qat_scheme:{args.qat_scheme} qat_start_step:{args.qat_start_step}"
     )
     if base_model.use_recurrence:
@@ -1835,14 +1849,27 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, curr_seq_len, grad_accum_steps)
             teacher_logits: Tensor | None = None
+            token_weights: Tensor | None = None
             if distill_active and ema_teacher is not None:
                 with torch.inference_mode():
                     teacher_logits = ema_teacher.forward_logits(x).detach()
+            if args.byte_weighted_loss_enabled:
+                with torch.no_grad():
+                    prev_ids = x.reshape(-1)
+                    tgt_ids = y.reshape(-1)
+                    token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.float32)
+                    token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.float32)
+                    mean_bytes = token_bytes.mean().clamp_min(1e-6)
+                    rel = token_bytes / mean_bytes
+                    alpha = float(args.byte_weighted_loss_alpha)
+                    rel = (1.0 - alpha) + alpha * rel
+                    token_weights = rel.reshape_as(y)
             if autocast_enabled:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     loss = model(
                         x,
                         y,
+                        per_token_weights=token_weights,
                         distill_teacher_logits=teacher_logits,
                         distill_weight=args.distill_weight if distill_active else 0.0,
                         distill_temp=args.distill_temp,
@@ -1852,6 +1879,7 @@ def main() -> None:
                 loss = model(
                     x,
                     y,
+                    per_token_weights=token_weights,
                     distill_teacher_logits=teacher_logits,
                     distill_weight=args.distill_weight if distill_active else 0.0,
                     distill_temp=args.distill_temp,
