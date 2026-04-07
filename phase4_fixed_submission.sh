@@ -189,6 +189,13 @@ export RESIDUAL_TRIGRAM_RANK="${RESIDUAL_TRIGRAM_RANK:-0}"
 export RESIDUAL_NGRAM_LR="${RESIDUAL_NGRAM_LR:-0.04}"
 export RESIDUAL_NGRAM_MIX_INIT="${RESIDUAL_NGRAM_MIX_INIT:--2.5}"
 
+# Pointer-style local copy/cache head.
+export COPY_CACHE_ENABLED="${COPY_CACHE_ENABLED:-0}"
+export COPY_CACHE_WINDOW="${COPY_CACHE_WINDOW:-256}"
+export COPY_CACHE_DIM="${COPY_CACHE_DIM:-64}"
+export COPY_CACHE_LR="${COPY_CACHE_LR:-0.02}"
+export COPY_CACHE_GATE_INIT="${COPY_CACHE_GATE_INIT:--4.0}"
+
 # 4. SWA: average weights during warmdown (confirmed 0.5-1.5% gain, also improves quantization)
 export SWA_ENABLED="${SWA_ENABLED:-1}"
 export SWA_COLLECT_EVERY="${SWA_COLLECT_EVERY:-10}"
@@ -234,6 +241,7 @@ echo "eval_seq_len:   ${EVAL_SEQ_LEN}  (0=train_seq_len)"
 echo "eval_rope_scale:${EVAL_ROPE_SCALE}"
 echo "bigram_rank:    ${BIGRAM_RANK}  (0=disabled)"
 echo "residual_ngram: ${RESIDUAL_NGRAM_ENABLED} (bigram_rank=${RESIDUAL_BIGRAM_RANK} trigram_rank=${RESIDUAL_TRIGRAM_RANK} lr=${RESIDUAL_NGRAM_LR} mix_init=${RESIDUAL_NGRAM_MIX_INIT})"
+echo "copy_cache:     ${COPY_CACHE_ENABLED} (window=${COPY_CACHE_WINDOW} dim=${COPY_CACHE_DIM} lr=${COPY_CACHE_LR} gate_init=${COPY_CACHE_GATE_INIT})"
 echo "muon_momentum:  ${MUON_MOMENTUM}"
 echo "grad_clip_norm: ${GRAD_CLIP_NORM}"
 echo "quant:          ${QUANT_SCHEME}+${COMPRESSOR}"

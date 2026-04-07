@@ -86,6 +86,14 @@ class Hyperparameters:
     residual_trigram_rank = int(os.environ.get("RESIDUAL_TRIGRAM_RANK", "0"))
     residual_ngram_lr = float(os.environ.get("RESIDUAL_NGRAM_LR", "0.04"))
     residual_ngram_mix_init = float(os.environ.get("RESIDUAL_NGRAM_MIX_INIT", "-2.5"))
+    # Pointer-style local copy/cache head.
+    # P(next) = (1-gate) * P_model + gate * P_copy, where P_copy attends to recent context
+    # positions and copies their next-token targets into vocab space.
+    copy_cache_enabled = bool(int(os.environ.get("COPY_CACHE_ENABLED", "0")))
+    copy_cache_window = int(os.environ.get("COPY_CACHE_WINDOW", "256"))
+    copy_cache_dim = int(os.environ.get("COPY_CACHE_DIM", "64"))
+    copy_cache_lr = float(os.environ.get("COPY_CACHE_LR", "0.02"))
+    copy_cache_gate_init = float(os.environ.get("COPY_CACHE_GATE_INIT", "-4.0"))
     # Stochastic Weight Averaging: average weights during the warmdown phase.
     # Takes the mean of snapshots every SWA_COLLECT_EVERY steps once LR starts decaying.
     # Research-confirmed ~0.5-1.5% BPB improvement, especially helps quantization quality.
@@ -1095,6 +1103,10 @@ class GPT(nn.Module):
         residual_bigram_rank: int = 0,
         residual_trigram_rank: int = 0,
         residual_ngram_mix_init: float = -2.5,
+        copy_cache_enabled: bool = False,
+        copy_cache_window: int = 256,
+        copy_cache_dim: int = 64,
+        copy_cache_gate_init: float = -4.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1126,6 +1138,10 @@ class GPT(nn.Module):
             self.residual_bigram_rank > 0 or self.residual_trigram_rank > 0
         )
         self.residual_ngram_mix_init = residual_ngram_mix_init
+        self.copy_cache_enabled = copy_cache_enabled
+        self.copy_cache_window = max(1, int(copy_cache_window))
+        self.copy_cache_dim = max(8, int(copy_cache_dim))
+        self.copy_cache_gate_init = copy_cache_gate_init
         self.total_effective_layers = (
             recurrent_core_layers * recurrent_steps if self.use_recurrence else num_layers
         )
@@ -1225,11 +1241,19 @@ class GPT(nn.Module):
                 self.residual_trigram_right._zero_init = True
             self.residual_ngram_scale = nn.Parameter(torch.ones(1, dtype=torch.float32))
             self.residual_ngram_gate = CastedLinear(model_dim, 1, bias=True)
+        if self.copy_cache_enabled:
+            self.copy_q = CastedLinear(model_dim, self.copy_cache_dim, bias=False)
+            self.copy_k = CastedLinear(model_dim, self.copy_cache_dim, bias=False)
+            self.copy_gate = CastedLinear(model_dim, 1, bias=True)
         self._init_weights()
         if self.residual_ngram_enabled:
             nn.init.zeros_(self.residual_ngram_gate.weight)
             if self.residual_ngram_gate.bias is not None:
                 nn.init.constant_(self.residual_ngram_gate.bias, self.residual_ngram_mix_init)
+        if self.copy_cache_enabled:
+            nn.init.zeros_(self.copy_gate.weight)
+            if self.copy_gate.bias is not None:
+                nn.init.constant_(self.copy_gate.bias, self.copy_cache_gate_init)
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -1255,20 +1279,62 @@ class GPT(nn.Module):
             return None
         return self.residual_ngram_scale * ngram_logits
 
-    def _compose_output_logits(self, logits_proj: Tensor, input_ids: Tensor, flat_h: Tensor) -> tuple[Tensor, bool]:
+    def _build_copy_cache_log_probs(self, hidden: Tensor, input_ids: Tensor, source_next_ids: Tensor) -> Tensor:
+        # hidden: [B, T, D], input_ids/source_next_ids: [B, T]
+        bsz, seqlen, _ = hidden.shape
+        q = self.copy_q(hidden).float()
+        k = self.copy_k(hidden).float()
+        scale = 1.0 / math.sqrt(float(self.copy_cache_dim))
+        att = torch.matmul(q, k.transpose(1, 2)) * scale  # [B, T, T]
+
+        pos = torch.arange(seqlen, device=hidden.device)
+        t_pos = pos.view(1, seqlen, 1)
+        j_pos = pos.view(1, 1, seqlen)
+        causal = j_pos < t_pos
+        within = (t_pos - j_pos) <= self.copy_cache_window
+        mask = causal & within
+        att = att.masked_fill(~mask, float("-inf"))
+        no_source = ~mask.any(dim=-1, keepdim=True)
+        att = torch.where(no_source, torch.zeros_like(att), att)
+        att_prob = F.softmax(att, dim=-1).masked_fill(no_source, 0.0)
+
+        copy_probs = torch.zeros((bsz, seqlen, self.tok_emb.num_embeddings), device=hidden.device, dtype=torch.float32)
+        copy_probs.scatter_add_(
+            2,
+            source_next_ids.unsqueeze(1).expand(-1, seqlen, -1),
+            att_prob,
+        )
+        return torch.log(copy_probs.clamp_min(1e-9))
+
+    def _compose_output_logits(
+        self,
+        logits_proj: Tensor,
+        input_ids: Tensor,
+        hidden: Tensor,
+        source_next_ids: Tensor | None = None,
+    ) -> tuple[Tensor, bool]:
         neural_logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         ngram_logits = self._compute_residual_ngram_logits(input_ids)
-        if ngram_logits is None:
-            return neural_logits, False
+        composed = neural_logits
+        if ngram_logits is not None:
+            # Stable residual composition in logit space.
+            gate = torch.sigmoid(self.residual_ngram_gate(hidden.reshape(-1, hidden.size(-1))))
+            ngram_logits = self.logit_softcap * torch.tanh(ngram_logits / self.logit_softcap)
+            composed = composed + gate.to(dtype=composed.dtype) * ngram_logits.to(dtype=composed.dtype)
 
-        gate = torch.sigmoid(self.residual_ngram_gate(flat_h).float()).clamp(min=1e-4, max=1.0 - 1e-4)
-        neural_log_probs = F.log_softmax(neural_logits.float(), dim=-1)
-        ngram_log_probs = F.log_softmax(ngram_logits.float(), dim=-1)
+        if not self.copy_cache_enabled:
+            return composed, False
+
+        if source_next_ids is None:
+            source_next_ids = torch.cat((input_ids[:, 1:], input_ids[:, -1:]), dim=1)
+        copy_log_probs = self._build_copy_cache_log_probs(hidden, input_ids, source_next_ids)
+        model_log_probs = F.log_softmax(composed.float().reshape(input_ids.size(0), input_ids.size(1), -1), dim=-1)
+        gate = torch.sigmoid(self.copy_gate(hidden).float()).clamp(min=1e-4, max=1.0 - 1e-4)
         mixed_log_probs = torch.logaddexp(
-            torch.log1p(-gate) + neural_log_probs,
-            torch.log(gate) + ngram_log_probs,
+            torch.log1p(-gate) + model_log_probs,
+            torch.log(gate) + copy_log_probs,
         )
-        return mixed_log_probs.to(dtype=neural_logits.dtype), True
+        return mixed_log_probs.reshape(-1, mixed_log_probs.size(-1)).to(dtype=composed.dtype), True
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -1299,7 +1365,8 @@ class GPT(nn.Module):
         if self.bigram_rank > 0:
             bg = self.bigram_right(self.bigram_left(input_ids.reshape(-1)))  # [B*T, vocab]
             logits_proj = logits_proj + self.bigram_scale * bg
-        logits, _ = self._compose_output_logits(logits_proj, input_ids, flat_h)
+        h = self.final_norm(x)
+        logits, _ = self._compose_output_logits(logits_proj, input_ids, h)
         return logits
 
     def forward(
@@ -1344,7 +1411,12 @@ class GPT(nn.Module):
         if self.bigram_rank > 0:
             bg = self.bigram_right(self.bigram_left(input_ids.reshape(-1)))  # [B*T, vocab]
             logits_proj = logits_proj + self.bigram_scale * bg
-        logits, logits_are_log_probs = self._compose_output_logits(logits_proj, input_ids, flat_h)
+        logits, logits_are_log_probs = self._compose_output_logits(
+            logits_proj,
+            input_ids,
+            h,
+            source_next_ids=target_ids,
+        )
         if logits_are_log_probs:
             base_per_token = F.nll_loss(logits.float(), targets, reduction="none")  # [B*T]
         else:
@@ -1373,7 +1445,7 @@ class GPT(nn.Module):
             temp = max(float(distill_temp), 1e-4)
             if logits_are_log_probs:
                 student_log_probs = logits.float()
-                teacher_probs = distill_teacher_logits.float().exp()
+                teacher_probs = F.softmax(distill_teacher_logits.float(), dim=-1)
             else:
                 student = (logits.float() / temp)
                 teacher = (distill_teacher_logits.float() / temp)
@@ -1623,6 +1695,10 @@ def main() -> None:
         residual_bigram_rank=args.residual_bigram_rank,
         residual_trigram_rank=args.residual_trigram_rank,
         residual_ngram_mix_init=args.residual_ngram_mix_init,
+        copy_cache_enabled=args.copy_cache_enabled,
+        copy_cache_window=args.copy_cache_window,
+        copy_cache_dim=args.copy_cache_dim,
+        copy_cache_gate_init=args.copy_cache_gate_init,
     ).to(device=device, dtype=torch.bfloat16 if autocast_enabled else torch.float32)
     if autocast_enabled:
         for module in base_model.modules():
@@ -1709,6 +1785,21 @@ def main() -> None:
             fused=autocast_enabled,
         )
         optimizers.append(optimizer_residual)
+    if args.copy_cache_enabled and getattr(base_model, "copy_cache_enabled", False):
+        copy_params: list[nn.Parameter] = [
+            base_model.copy_q.weight,
+            base_model.copy_k.weight,
+            base_model.copy_gate.weight,
+        ]
+        if base_model.copy_gate.bias is not None:
+            copy_params.append(base_model.copy_gate.bias)
+        optimizer_copy = torch.optim.Adam(
+            [{"params": copy_params, "lr": args.copy_cache_lr, "base_lr": args.copy_cache_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=autocast_enabled,
+        )
+        optimizers.append(optimizer_copy)
     if args.mtp_enabled and base_model.mtp_branches is not None:
         mtp_params: list[nn.Parameter] = []
         for branch in base_model.mtp_branches:
@@ -1750,6 +1841,9 @@ def main() -> None:
         f"residual_ngram_enabled:{args.residual_ngram_enabled} residual_bigram_rank:{args.residual_bigram_rank} "
         f"residual_trigram_rank:{args.residual_trigram_rank} residual_ngram_lr:{args.residual_ngram_lr} "
         f"residual_ngram_mix_init:{args.residual_ngram_mix_init} "
+        f"copy_cache_enabled:{args.copy_cache_enabled} copy_cache_window:{args.copy_cache_window} "
+        f"copy_cache_dim:{args.copy_cache_dim} copy_cache_lr:{args.copy_cache_lr} "
+        f"copy_cache_gate_init:{args.copy_cache_gate_init} "
         f"qat_scheme:{args.qat_scheme} qat_start_step:{args.qat_start_step}"
     )
     if base_model.use_recurrence:
@@ -1769,7 +1863,8 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} mtp_lr:{args.mtp_lr if args.mtp_enabled else 0.0}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} mtp_lr:{args.mtp_lr if args.mtp_enabled else 0.0} "
+        f"copy_cache_lr:{args.copy_cache_lr if args.copy_cache_enabled else 0.0}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
