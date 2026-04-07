@@ -2035,7 +2035,9 @@ def main() -> None:
     if distributed:
         # find_unused_parameters=True is required when QAT_LSQ=1 because
         # qat_log_scale params are registered but sit idle until QAT activates.
-        _ddp_find_unused = bool(args.qat_lsq)
+        # Dual-head params can also be intentionally inactive during warmup / before
+        # DUAL_HEAD_START_FRAC, so include that condition as well.
+        _ddp_find_unused = bool(args.qat_lsq or args.dual_head_enabled)
         model = (
             DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=_ddp_find_unused)
             if device.type == "cuda"
