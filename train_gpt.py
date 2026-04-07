@@ -2006,7 +2006,14 @@ def main() -> None:
     compiled_model = torch.compile(base_model, dynamic=True) if use_compile else base_model
     model: nn.Module
     if distributed:
-        model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if device.type == "cuda" else DDP(compiled_model, broadcast_buffers=False)
+        # find_unused_parameters=True is required when QAT_LSQ=1 because
+        # qat_log_scale params are registered but sit idle until QAT activates.
+        _ddp_find_unused = bool(args.qat_lsq)
+        model = (
+            DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=_ddp_find_unused)
+            if device.type == "cuda"
+            else DDP(compiled_model, broadcast_buffers=False, find_unused_parameters=_ddp_find_unused)
+        )
     else:
         model = compiled_model
 
