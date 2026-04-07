@@ -117,6 +117,13 @@ class Hyperparameters:
     distill_weight = float(os.environ.get("DISTILL_WEIGHT", "0.1"))
     distill_temp = float(os.environ.get("DISTILL_TEMP", "1.5"))
     distill_ema_decay = float(os.environ.get("DISTILL_EMA_DECAY", "0.999"))
+    # Dual-head objective: auxiliary coarse-structure prediction head.
+    # Classes are derived from token properties (boundary/space/byte-length) and trained
+    # with a small coefficient so the main LM head can focus on harder entropy.
+    dual_head_enabled = bool(int(os.environ.get("DUAL_HEAD_ENABLED", "0")))
+    dual_head_weight = float(os.environ.get("DUAL_HEAD_WEIGHT", "0.05"))
+    dual_head_start_frac = float(os.environ.get("DUAL_HEAD_START_FRAC", "0.0"))
+    dual_head_lr = float(os.environ.get("DUAL_HEAD_LR", "0.02"))
     # Logit range regularization on pre-softcap logits for quantization robustness.
     logit_reg_weight = float(os.environ.get("LOGIT_REG_WEIGHT", "0.0"))
     # Byte-weighted training loss (align objective closer to tokenizer-agnostic BPB).
@@ -1371,6 +1378,8 @@ class GPT(nn.Module):
         moe_every_n: int = 2,
         moe_capacity_factor: float = 1.0,
         moe_aux_loss_coeff: float = 1e-3,
+        dual_head_enabled: bool = False,
+        dual_head_num_classes: int = 4,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1406,6 +1415,8 @@ class GPT(nn.Module):
         self.copy_cache_window = max(1, int(copy_cache_window))
         self.copy_cache_dim = max(8, int(copy_cache_dim))
         self.copy_cache_gate_init = copy_cache_gate_init
+        self.dual_head_enabled = bool(dual_head_enabled)
+        self.dual_head_num_classes = max(2, int(dual_head_num_classes))
         self.total_effective_layers = (
             recurrent_core_layers * recurrent_steps if self.use_recurrence else num_layers
         )
@@ -1485,6 +1496,7 @@ class GPT(nn.Module):
         self.num_attn_blocks = len(self.blocks) - self.num_ssm_blocks
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
+        self.dual_head = CastedLinear(model_dim, self.dual_head_num_classes, bias=True) if self.dual_head_enabled else None
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         if self.mtp_enabled:
@@ -1656,6 +1668,8 @@ class GPT(nn.Module):
         target_ids: Tensor,
         loss_mask: Tensor | None = None,
         per_token_weights: Tensor | None = None,
+        aux_targets: Tensor | None = None,
+        aux_weight: float = 0.0,
         distill_teacher_logits: Tensor | None = None,
         distill_weight: float = 0.0,
         distill_temp: float = 1.0,
@@ -1722,6 +1736,17 @@ class GPT(nn.Module):
         base_loss = weighted.sum() / norm
 
         total_loss = base_loss
+
+        if self.dual_head is not None and aux_targets is not None and aux_weight > 0.0:
+            aux_logits = self.dual_head(flat_h)  # [B*T, C]
+            aux_flat_targets = aux_targets.reshape(-1)
+            aux_per_token = F.cross_entropy(aux_logits.float(), aux_flat_targets, reduction="none")
+            if loss_mask is not None:
+                mask = loss_mask.reshape(-1).to(aux_per_token.dtype)
+                aux_loss = (aux_per_token * mask).sum() / mask.sum().clamp(min=1)
+            else:
+                aux_loss = aux_per_token.mean()
+            total_loss = total_loss + float(aux_weight) * aux_loss
 
         if logit_reg_weight > 0.0:
             total_loss = total_loss + float(logit_reg_weight) * logits_proj.float().pow(2).mean()
@@ -1997,6 +2022,8 @@ def main() -> None:
         moe_every_n=args.moe_every_n,
         moe_capacity_factor=args.moe_capacity_factor,
         moe_aux_loss_coeff=args.moe_aux_loss_coeff,
+        dual_head_enabled=args.dual_head_enabled,
+        dual_head_num_classes=4,
     ).to(device=device, dtype=torch.bfloat16 if autocast_enabled else torch.float32)
     if autocast_enabled:
         for module in base_model.modules():
@@ -2106,6 +2133,17 @@ def main() -> None:
             fused=autocast_enabled,
         )
         optimizers.append(optimizer_copy)
+    if args.dual_head_enabled and getattr(base_model, "dual_head", None) is not None:
+        dual_params = [base_model.dual_head.weight]
+        if base_model.dual_head.bias is not None:
+            dual_params.append(base_model.dual_head.bias)
+        optimizer_dual = torch.optim.Adam(
+            [{"params": dual_params, "lr": args.dual_head_lr, "base_lr": args.dual_head_lr}],
+            betas=(args.beta1, args.beta2),
+            eps=args.adam_eps,
+            fused=autocast_enabled,
+        )
+        optimizers.append(optimizer_dual)
     if args.mtp_enabled and base_model.mtp_branches is not None:
         mtp_params: list[nn.Parameter] = []
         for branch in base_model.mtp_branches:
@@ -2171,6 +2209,8 @@ def main() -> None:
         f"copy_cache_enabled:{args.copy_cache_enabled} copy_cache_window:{args.copy_cache_window} "
         f"copy_cache_dim:{args.copy_cache_dim} copy_cache_lr:{args.copy_cache_lr} "
         f"copy_cache_gate_init:{args.copy_cache_gate_init} "
+        f"dual_head_enabled:{args.dual_head_enabled} dual_head_weight:{args.dual_head_weight} "
+        f"dual_head_start_frac:{args.dual_head_start_frac} dual_head_lr:{args.dual_head_lr} "
         f"qat_scheme:{args.qat_scheme} qat_start_step:{args.qat_start_step} "
         f"moe_num_experts:{args.moe_num_experts} moe_every_n:{args.moe_every_n} "
         f"moe_capacity_factor:{args.moe_capacity_factor} moe_aux_loss_coeff:{args.moe_aux_loss_coeff} "
@@ -2194,7 +2234,8 @@ def main() -> None:
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} mtp_lr:{args.mtp_lr if args.mtp_enabled else 0.0} "
-        f"copy_cache_lr:{args.copy_cache_lr if args.copy_cache_enabled else 0.0}"
+        f"copy_cache_lr:{args.copy_cache_lr if args.copy_cache_enabled else 0.0} "
+        f"dual_head_lr:{args.dual_head_lr if args.dual_head_enabled else 0.0}"
     )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
@@ -2258,6 +2299,7 @@ def main() -> None:
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     distill_start_step = int(max(0.0, min(1.0, args.distill_start_frac)) * args.iterations)
+    dual_head_start_step = int(max(0.0, min(1.0, args.dual_head_start_frac)) * args.iterations)
     ema_teacher: GPT | None = None
     if args.distill_enabled and args.distill_weight > 0.0:
         ema_teacher = copy.deepcopy(base_model)
@@ -2388,6 +2430,11 @@ def main() -> None:
             and step >= distill_start_step
             and args.distill_weight > 0.0
         )
+        dual_head_active_weight = (
+            float(args.dual_head_weight)
+            if args.dual_head_enabled and step >= dual_head_start_step and args.dual_head_weight > 0.0
+            else 0.0
+        )
 
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
@@ -2397,6 +2444,7 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, curr_seq_len, grad_accum_steps)
             teacher_logits: Tensor | None = None
             token_weights: Tensor | None = None
+            aux_targets: Tensor | None = None
             if distill_active and ema_teacher is not None:
                 # Use no_grad (not inference_mode) because inference tensors can error when
                 # downstream ops save them for backward (e.g., KL in distillation under compile).
@@ -2413,12 +2461,26 @@ def main() -> None:
                     alpha = float(args.byte_weighted_loss_alpha)
                     rel = (1.0 - alpha) + alpha * rel
                     token_weights = rel.reshape_as(y)
+            if dual_head_active_weight > 0.0:
+                with torch.no_grad():
+                    prev_ids = x.reshape(-1)
+                    tgt_ids = y.reshape(-1)
+                    is_boundary = is_boundary_token_lut[tgt_ids]
+                    has_space = has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
+                    is_long = base_bytes_lut[tgt_ids] >= 4
+                    cls = torch.zeros_like(tgt_ids, dtype=torch.long)
+                    cls = torch.where(has_space, torch.ones_like(cls), cls)           # class 1: leading-space continuation
+                    cls = torch.where(is_long, torch.full_like(cls, 2), cls)          # class 2: long piece (4+ bytes)
+                    cls = torch.where(is_boundary, torch.full_like(cls, 3), cls)      # class 3: boundary/special
+                    aux_targets = cls.reshape_as(y)
             if autocast_enabled:
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     loss = model(
                         x,
                         y,
                         per_token_weights=token_weights,
+                        aux_targets=aux_targets,
+                        aux_weight=dual_head_active_weight,
                         distill_teacher_logits=teacher_logits,
                         distill_weight=args.distill_weight if distill_active else 0.0,
                         distill_temp=args.distill_temp,
@@ -2429,6 +2491,8 @@ def main() -> None:
                     x,
                     y,
                     per_token_weights=token_weights,
+                    aux_targets=aux_targets,
+                    aux_weight=dual_head_active_weight,
                     distill_teacher_logits=teacher_logits,
                     distill_weight=args.distill_weight if distill_active else 0.0,
                     distill_temp=args.distill_temp,

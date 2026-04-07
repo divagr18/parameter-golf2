@@ -180,6 +180,10 @@ export DISTILL_EMA_DECAY="${DISTILL_EMA_DECAY:-0.999}"
 export LOGIT_REG_WEIGHT="${LOGIT_REG_WEIGHT:-0.0}"
 export BYTE_WEIGHTED_LOSS_ENABLED="${BYTE_WEIGHTED_LOSS_ENABLED:-0}"
 export BYTE_WEIGHTED_LOSS_ALPHA="${BYTE_WEIGHTED_LOSS_ALPHA:-1.0}"
+export DUAL_HEAD_ENABLED="${DUAL_HEAD_ENABLED:-0}"
+export DUAL_HEAD_WEIGHT="${DUAL_HEAD_WEIGHT:-0.05}"
+export DUAL_HEAD_START_FRAC="${DUAL_HEAD_START_FRAC:-0.0}"
+export DUAL_HEAD_LR="${DUAL_HEAD_LR:-0.02}"
 
 # Gradient clipping: helps stability, especially with Muon at high momentum
 export GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-1.0}"
@@ -260,6 +264,7 @@ echo "use_mtp:        ${MTP_ENABLED} (steps=${MTP_STEPS} weight=${MTP_WEIGHT} de
 echo "distill:        ${DISTILL_ENABLED} (start_frac=${DISTILL_START_FRAC} weight=${DISTILL_WEIGHT} temp=${DISTILL_TEMP} ema=${DISTILL_EMA_DECAY})"
 echo "logit_reg_w:    ${LOGIT_REG_WEIGHT}"
 echo "byte_loss:      ${BYTE_WEIGHTED_LOSS_ENABLED} (alpha=${BYTE_WEIGHTED_LOSS_ALPHA})"
+echo "dual_head:      ${DUAL_HEAD_ENABLED} (weight=${DUAL_HEAD_WEIGHT} start_frac=${DUAL_HEAD_START_FRAC} lr=${DUAL_HEAD_LR})"
 echo "eval_stride:    ${EVAL_STRIDE_FRAC}  (sliding window eval)"
 echo "eval_seq_len:   ${EVAL_SEQ_LEN}  (0=train_seq_len)"
 echo "eval_rope_scale:${EVAL_ROPE_SCALE}"
