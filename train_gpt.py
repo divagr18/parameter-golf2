@@ -2318,25 +2318,32 @@ def main() -> None:
             # Load SWA-averaged weights before eval + export (better generalization + quantization).
             if args.swa_enabled and swa_state is not None:
                 log0(f"swa: loading averaged weights from {swa_count} snapshots")
-                base_model.load_state_dict(
-                    {k: v.to(device=device, dtype=base_model.state_dict()[k].dtype) for k, v in swa_state.items()},
-                    strict=True,
-                )
+                cur_dtypes = {k: v.dtype for k, v in base_model.state_dict().items()}
+                swa_load = {k: v.to(device=device, dtype=cur_dtypes[k]) for k, v in swa_state.items() if k in cur_dtypes}
+                # strict=False because qat_log_scale entries are intentionally excluded from swa_state.
+                base_model.load_state_dict(swa_load, strict=not args.qat_lsq)
             break
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
 
         # SWA: once warmdown begins (scale < 1), start averaging weights on CPU every N steps.
+        # qat_log_scale params are intentionally excluded: SWA would corrupt them by averaging
+        # scales from different QAT level regimes (256/64/16). The final trained scales are kept.
         if args.swa_enabled and scale < 1.0 and step % args.swa_collect_every == 0:
+            swa_snapshot = {
+                k: v.detach().cpu().float().clone()
+                for k, v in base_model.state_dict().items()
+                if not k.endswith(".qat_log_scale")
+            }
             if swa_state is None:
-                swa_state = {k: v.detach().cpu().float().clone() for k, v in base_model.state_dict().items()}
+                swa_state = swa_snapshot
                 swa_count = 1
             else:
                 inv = 1.0 / (swa_count + 1)
-                for k, v in base_model.state_dict().items():
+                for k, v in swa_snapshot.items():
                     if k in swa_state:
-                        swa_state[k].mul_(1.0 - inv).add_(v.detach().cpu().float(), alpha=inv)
+                        swa_state[k].mul_(1.0 - inv).add_(v, alpha=inv)
                 swa_count += 1
 
         # QAT: enable fake-quantisation once model has partially converged.
