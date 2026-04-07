@@ -135,6 +135,23 @@ export SHARE_FFN_ACROSS_BLOCKS="${SHARE_FFN_ACROSS_BLOCKS:-0}"
 # SwiGLU: better activation than relu² at same parameter budget
 export USE_SWIGLU="${USE_SWIGLU:-0}"
 
+# Mixture of Experts (MoE): replace dense MLPs with sparse expert routing.
+# MOE_NUM_EXPERTS=0 → disabled (dense).  2+ → Expert Choice routing.
+# MOE_EVERY_N=1 → all layers MoE; =2 → alternating even layers; =3 → every 3rd.
+# MOE_CAPACITY_FACTOR: tokens each expert sees = int(cf * B*T / E); 1.0 = balanced.
+# MOE_AUX_LOSS_COEFF: router Z-loss weight (prevents routing collapse).
+export MOE_NUM_EXPERTS="${MOE_NUM_EXPERTS:-0}"
+export MOE_EVERY_N="${MOE_EVERY_N:-2}"
+export MOE_CAPACITY_FACTOR="${MOE_CAPACITY_FACTOR:-1.0}"
+export MOE_AUX_LOSS_COEFF="${MOE_AUX_LOSS_COEFF:-1e-3}"
+
+# Quantization-Aware Training (QAT): fake-quantise weights late in training.
+# QAT_SCHEME: "none" | "int8" | "int4"  — should match QUANT_SCHEME at export.
+# QAT_START_STEP: delay QAT until ~65-75% of expected total steps.
+#   int4 uses a 3-stage progressive schedule (256→64→16 levels) to avoid spikes.
+export QAT_SCHEME="${QAT_SCHEME:-none}"
+export QAT_START_STEP="${QAT_START_STEP:-9000}"
+
 # Optional hybrid SSM blocks: replace every Nth attention block with an SSM-style mixer.
 export USE_SSM="${USE_SSM:-0}"
 export SSM_EVERY_N="${SSM_EVERY_N:-2}"
@@ -231,6 +248,8 @@ echo "grad_accum:     ${GRAD_ACCUM_STEPS}"
 echo "model:          dim=${MODEL_DIM} layers=${NUM_LAYERS} heads=${NUM_HEADS} kv=${NUM_KV_HEADS} mlp_mult=${MLP_MULT}"
 echo "recurrence:     core=${RECURRENT_CORE_LAYERS} steps=${RECURRENT_STEPS}  [FIX: was 3×6]"
 echo "use_swiglu:     ${USE_SWIGLU}"
+echo "moe:            experts=${MOE_NUM_EXPERTS} every_n=${MOE_EVERY_N} cap=${MOE_CAPACITY_FACTOR} aux=${MOE_AUX_LOSS_COEFF}"
+echo "qat:            scheme=${QAT_SCHEME} start_step=${QAT_START_STEP}"
 echo "use_ssm:        ${USE_SSM} (every_n=${SSM_EVERY_N} expand=${SSM_EXPAND} kernel=${SSM_KERNEL})"
 echo "use_mtp:        ${MTP_ENABLED} (steps=${MTP_STEPS} weight=${MTP_WEIGHT} decay=${MTP_DECAY} tie=${MTP_TIE_EMBEDDINGS} lr=${MTP_LR})"
 echo "distill:        ${DISTILL_ENABLED} (start_frac=${DISTILL_START_FRAC} weight=${DISTILL_WEIGHT} temp=${DISTILL_TEMP} ema=${DISTILL_EMA_DECAY})"

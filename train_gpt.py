@@ -148,6 +148,16 @@ class Hyperparameters:
     recurrent_steps = int(os.environ.get("RECURRENT_STEPS", 0))
     share_ffn_across_blocks = bool(int(os.environ.get("SHARE_FFN_ACROSS_BLOCKS", "0")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
+    # Mixture of Experts (MoE): replace dense MLPs with sparse expert routing.
+    # MOE_NUM_EXPERTS=0  → disabled (dense MLP as usual)
+    # MOE_NUM_EXPERTS=2  → 2 experts per MoE layer, Expert Choice routing
+    # MOE_EVERY_N=1      → all layers are MoE; =2 → alternating (even layers); =3 → every 3rd
+    # MOE_CAPACITY_FACTOR: each expert sees int(cf * S / E) tokens (1.0 = perfect balance)
+    # MOE_AUX_LOSS_COEFF: weight on router Z-loss (stabilises routing, prevents collapse)
+    moe_num_experts = int(os.environ.get("MOE_NUM_EXPERTS", "0"))
+    moe_every_n = int(os.environ.get("MOE_EVERY_N", "2"))
+    moe_capacity_factor = float(os.environ.get("MOE_CAPACITY_FACTOR", "1.0"))
+    moe_aux_loss_coeff = float(os.environ.get("MOE_AUX_LOSS_COEFF", "1e-3"))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
@@ -977,6 +987,149 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class MoEMLP(nn.Module):
+    """Sparse Mixture-of-Experts MLP with Expert Choice routing.
+
+    Design goals
+    ============
+    1. **torch.compile(fullgraph=True) compatible** — Expert Choice routing gives
+       every expert a statically-shaped slice of tokens [capacity, D], avoiding the
+       dynamic-shape issues of token-choice top-k dispatch.
+    2. **QAT-aware** — all expert weights are CastedLinear, so the class-level
+       CastedLinear.qat_levels switch applies uniformly to router and experts.
+    3. **Muon-trained** — CastedLinear parameters are automatically picked up by
+       the existing Muon parameter-group logic (2-D weight matrices).
+    4. **Load-balanced by construction** — each expert always processes exactly
+       `capacity` tokens, so no explicit load-balance loss is required.
+    5. **Router stability via Z-loss** — a small penalty on router logit magnitudes
+       prevents collapse (all tokens always sent to one expert).
+
+    Expert Choice routing (Zhou et al., 2022)
+    ==========================================
+    Instead of each token selecting its top-k experts (token choice), each expert
+    selects the top `capacity` tokens it wants to process:
+
+        capacity = max(1, int(capacity_factor * S / E))   # S = B*T, E = num_experts
+
+        router_probs  [S, E]  = softmax(router_logits)
+        top_scores    [E, cap]  \\
+        top_indices   [E, cap]  /  = router_probs.T.topk(capacity, dim=1)
+
+    For each expert i:
+        expert_input  = x_flat[top_indices[i]]          # [cap, D]  — gather
+        expert_out    = expert_mlp_i(expert_input)       # [cap, D]
+        expert_out   *= top_scores[i]                    # weighted by routing prob
+        output       += scatter(expert_out, top_indices[i])   # accumulate
+
+    Every tensor shape is statically determined → fullgraph compile succeeds.
+
+    Args:
+        dim             : model hidden dimension
+        mlp_mult        : MLP width multiplier (identical to base MLP)
+        num_experts     : number of expert MLPs (E); must be ≥ 2
+        capacity_factor : fraction of tokens each expert sees; 1.0 = perfect coverage
+        use_swiglu      : SwiGLU activation (matching the base MLP choice)
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        mlp_mult: int,
+        num_experts: int,
+        capacity_factor: float = 1.0,
+        use_swiglu: bool = False,
+    ):
+        super().__init__()
+        if num_experts < 2:
+            raise ValueError(f"MoEMLP requires num_experts >= 2, got {num_experts}")
+        self.num_experts = num_experts
+        self.capacity_factor = capacity_factor
+        self.use_swiglu = use_swiglu
+
+        # Router: linear map from hidden dim to expert scores.
+        # CastedLinear → participates in QAT and Muon automatically.
+        self.router = CastedLinear(dim, num_experts, bias=False)
+
+        # Per-expert weight matrices stored as ModuleLists of CastedLinear.
+        # This is intentionally verbose (vs stacked tensors) so that:
+        #   a) Each expert participates in QAT via CastedLinear.qat_levels
+        #   b) Muon picks them up as standard 2-D parameters
+        #   c) Zero-init of proj layers is handled naturally via _zero_init flag
+        if use_swiglu:
+            hidden = max(64, (2 * mlp_mult * dim // 3 // 64) * 64)
+            self.expert_gates = nn.ModuleList([CastedLinear(dim, hidden, bias=False) for _ in range(num_experts)])
+            self.expert_fcs   = nn.ModuleList([CastedLinear(dim, hidden, bias=False) for _ in range(num_experts)])
+            self.expert_projs = nn.ModuleList([CastedLinear(hidden, dim, bias=False) for _ in range(num_experts)])
+            for m in self.expert_projs:
+                m._zero_init = True
+        else:
+            hidden = mlp_mult * dim
+            self.expert_gates = nn.ModuleList()   # unused for relu²; kept for uniform attr
+            self.expert_fcs   = nn.ModuleList([CastedLinear(dim, hidden, bias=False) for _ in range(num_experts)])
+            self.expert_projs = nn.ModuleList([CastedLinear(hidden, dim, bias=False) for _ in range(num_experts)])
+            for m in self.expert_projs:
+                m._zero_init = True
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        """
+        Args:
+            x : [B, T, D]
+        Returns:
+            output : [B, T, D]  — same shape as input
+            z_loss : scalar    — router Z-loss; add to training loss via moe_aux_loss_coeff
+        """
+        B, T, D = x.shape
+        S = B * T
+        x_flat = x.reshape(S, D)
+
+        # ── Router ──────────────────────────────────────────────────────────
+        router_logits = self.router(x_flat)                        # [S, E]  (bfloat16)
+
+        # Z-loss (Zoph et al., 2022 "ST-MoE"):
+        #   z_loss = mean( log(∑_e exp(router_logits))² )
+        # Keeps router logits from growing large → prevents routing collapse.
+        z_loss: Tensor = torch.logsumexp(router_logits.float(), dim=-1).square().mean()
+
+        router_probs = torch.softmax(router_logits.float(), dim=-1)  # [S, E]
+
+        # ── Expert Choice: each expert picks its top-capacity tokens ─────────
+        # capacity is a Python int → static shape → fullgraph-compile friendly
+        capacity = max(1, int(self.capacity_factor * S / self.num_experts))
+
+        # router_probs.T is [E, S]; topk over dim=1 selects the top-capacity token
+        # indices per expert. Both outputs have static shape [E, capacity].
+        top_scores, top_indices = router_probs.T.topk(capacity, dim=1)  # [E, cap]
+
+        # ── Expert forward + weighted scatter ────────────────────────────────
+        output = torch.zeros_like(x_flat)   # [S, D]
+
+        for i in range(self.num_experts):
+            # Gather the tokens this expert selected.  Shape: [cap, D]
+            expert_in = x_flat[top_indices[i]]
+            weights   = top_scores[i].to(expert_in.dtype)          # [cap]
+
+            # Expert MLP forward (SwiGLU or relu²)
+            if self.use_swiglu:
+                h = F.silu(self.expert_gates[i](expert_in)) * self.expert_fcs[i](expert_in)
+                expert_out = self.expert_projs[i](h)
+            else:
+                h = torch.relu(self.expert_fcs[i](expert_in))
+                expert_out = self.expert_projs[i](h.square())
+
+            # Scale by routing probability (gradient flows through weights here)
+            expert_out = expert_out * weights.unsqueeze(-1)
+
+            # Scatter-add back into the output buffer at the positions this expert owns.
+            # top_indices[i] has static shape [cap]; unsqueeze(-1).expand gives [cap, D].
+            output.scatter_add_(
+                0,
+                top_indices[i].unsqueeze(-1).expand(-1, D),
+                expert_out,
+            )
+
+        return output.reshape(B, T, D), z_loss
+
+
 class SSMMixer(nn.Module):
     """Lightweight causal SSM-style mixer.
 
@@ -1039,6 +1192,8 @@ class Block(nn.Module):
         use_ssm: bool = False,
         ssm_expand: float = 2.0,
         ssm_kernel: int = 4,
+        moe_num_experts: int = 0,
+        moe_capacity_factor: float = 1.0,
     ):
         super().__init__()
         self.use_ssm = use_ssm
@@ -1050,12 +1205,20 @@ class Block(nn.Module):
         else:
             self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
             self.ssm = None
-        self.mlp = MLP(dim, mlp_mult, use_swiglu=use_swiglu)
+        # MoE or dense MLP — is_moe is a Python bool, resolved at compile time.
+        self.is_moe: bool = moe_num_experts >= 2
+        if self.is_moe:
+            self.mlp: MLP | MoEMLP = MoEMLP(dim, mlp_mult, moe_num_experts, moe_capacity_factor, use_swiglu)
+        else:
+            self.mlp = MLP(dim, mlp_mult, use_swiglu=use_swiglu)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor) -> tuple[Tensor, Tensor]:
+        """Returns (hidden_state, moe_z_loss).
+        moe_z_loss is a zero scalar for non-MoE blocks so callers can always
+        accumulate unconditionally without a Python-level branch."""
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         if self.use_ssm:
@@ -1067,8 +1230,13 @@ class Block(nn.Module):
                 raise RuntimeError("Attention block is enabled but attention module is missing")
             mix_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * mix_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
-        return x
+        if self.is_moe:
+            mlp_out, z_loss = self.mlp(self.mlp_norm(x))
+        else:
+            mlp_out = self.mlp(self.mlp_norm(x))
+            z_loss = x.new_zeros(())
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        return x, z_loss
 
 
 class GPT(nn.Module):
@@ -1107,6 +1275,10 @@ class GPT(nn.Module):
         copy_cache_window: int = 256,
         copy_cache_dim: int = 64,
         copy_cache_gate_init: float = -4.0,
+        moe_num_experts: int = 0,
+        moe_every_n: int = 2,
+        moe_capacity_factor: float = 1.0,
+        moe_aux_loss_coeff: float = 1e-3,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1146,8 +1318,15 @@ class GPT(nn.Module):
             recurrent_core_layers * recurrent_steps if self.use_recurrence else num_layers
         )
 
+        # MoE config stored on model (used in forward() to gate the aux loss)
+        self.moe_aux_loss_coeff = float(moe_aux_loss_coeff)
+        self._has_moe = moe_num_experts >= 2 and moe_every_n > 0
+
         def is_ssm_block(idx: int) -> bool:
             return self.use_ssm and self.ssm_every_n > 0 and ((idx + 1) % self.ssm_every_n == 0)
+
+        def is_moe_block(idx: int) -> bool:
+            return moe_num_experts >= 2 and moe_every_n > 0 and idx % moe_every_n == 0
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         if self.use_recurrence:
@@ -1170,11 +1349,14 @@ class GPT(nn.Module):
                         use_ssm=is_ssm_block(i),
                         ssm_expand=ssm_expand,
                         ssm_kernel=ssm_kernel,
+                        moe_num_experts=moe_num_experts if is_moe_block(i) else 0,
+                        moe_capacity_factor=moe_capacity_factor,
                     )
                     for i in range(recurrent_core_layers)
                 ]
             )
-            if share_ffn_across_blocks and len(self.blocks) > 1:
+            # SHARE_FFN_ACROSS_BLOCKS is incompatible with MoE (different experts per layer).
+            if share_ffn_across_blocks and len(self.blocks) > 1 and not self._has_moe:
                 shared_mlp = self.blocks[0].mlp
                 for i in range(1, len(self.blocks)):
                     self.blocks[i].mlp = shared_mlp
@@ -1196,11 +1378,18 @@ class GPT(nn.Module):
                         use_ssm=is_ssm_block(i),
                         ssm_expand=ssm_expand,
                         ssm_kernel=ssm_kernel,
+                        moe_num_experts=moe_num_experts if is_moe_block(i) else 0,
+                        moe_capacity_factor=moe_capacity_factor,
                     )
                     for i in range(num_layers)
                 ]
             )
+            if share_ffn_across_blocks and len(self.blocks) > 1 and not self._has_moe:
+                shared_mlp = self.blocks[0].mlp
+                for i in range(1, len(self.blocks)):
+                    self.blocks[i].mlp = shared_mlp
         self.num_ssm_blocks = sum(1 for block in self.blocks if block.use_ssm)
+        self.num_moe_blocks = sum(1 for block in self.blocks if block.is_moe)
         self.num_attn_blocks = len(self.blocks) - self.num_ssm_blocks
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
@@ -1343,17 +1532,17 @@ class GPT(nn.Module):
         if self.use_recurrence:
             for _ in range(self.recurrent_steps):
                 for block in self.blocks:
-                    x = block(x, x0)
+                    x, _ = block(x, x0)
         else:
             skips: list[Tensor] = []
             # First half stores skips; second half reuses them in reverse order.
             for i in range(self.num_encoder_layers):
-                x = self.blocks[i](x, x0)
+                x, _ = self.blocks[i](x, x0)
                 skips.append(x)
             for i in range(self.num_decoder_layers):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                x = self.blocks[self.num_encoder_layers + i](x, x0)
+                x, _ = self.blocks[self.num_encoder_layers + i](x, x0)
 
         flat_h = self.final_norm(x).reshape(-1, x.size(-1))
         if self.tie_embeddings:
@@ -1383,20 +1572,24 @@ class GPT(nn.Module):
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
+        moe_z_loss: Tensor = x.new_zeros(())   # accumulates router Z-losses from all MoE blocks
         if self.use_recurrence:
             for _ in range(self.recurrent_steps):
                 for block in self.blocks:
-                    x = block(x, x0)
+                    x, zl = block(x, x0)
+                    moe_z_loss = moe_z_loss + zl
         else:
             skips: list[Tensor] = []
             # First half stores skips; second half reuses them in reverse order.
             for i in range(self.num_encoder_layers):
-                x = self.blocks[i](x, x0)
+                x, zl = self.blocks[i](x, x0)
+                moe_z_loss = moe_z_loss + zl
                 skips.append(x)
             for i in range(self.num_decoder_layers):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                x = self.blocks[self.num_encoder_layers + i](x, x0)
+                x, zl = self.blocks[self.num_encoder_layers + i](x, x0)
+                moe_z_loss = moe_z_loss + zl
 
         h = self.final_norm(x)
         flat_h = h.reshape(-1, h.size(-1))
@@ -1461,6 +1654,11 @@ class GPT(nn.Module):
                 reduction="batchmean",
             ) * (temp * temp if not logits_are_log_probs else 1.0)
             total_loss = total_loss + float(distill_weight) * kl
+
+        # MoE router Z-loss — only during training (loss_mask is None means no sliding-window eval mask).
+        # Follows the same pattern as MTP (excluded during eval to keep val_bpb clean).
+        if self._has_moe and self.moe_aux_loss_coeff > 0.0 and loss_mask is None:
+            total_loss = total_loss + self.moe_aux_loss_coeff * moe_z_loss
 
         # Keep eval metric comparable by applying MTP only when loss_mask is not provided.
         if not self.mtp_enabled or self.mtp_weight <= 0.0 or loss_mask is not None:
@@ -1699,6 +1897,10 @@ def main() -> None:
         copy_cache_window=args.copy_cache_window,
         copy_cache_dim=args.copy_cache_dim,
         copy_cache_gate_init=args.copy_cache_gate_init,
+        moe_num_experts=args.moe_num_experts,
+        moe_every_n=args.moe_every_n,
+        moe_capacity_factor=args.moe_capacity_factor,
+        moe_aux_loss_coeff=args.moe_aux_loss_coeff,
     ).to(device=device, dtype=torch.bfloat16 if autocast_enabled else torch.float32)
     if autocast_enabled:
         for module in base_model.modules():
@@ -1844,7 +2046,10 @@ def main() -> None:
         f"copy_cache_enabled:{args.copy_cache_enabled} copy_cache_window:{args.copy_cache_window} "
         f"copy_cache_dim:{args.copy_cache_dim} copy_cache_lr:{args.copy_cache_lr} "
         f"copy_cache_gate_init:{args.copy_cache_gate_init} "
-        f"qat_scheme:{args.qat_scheme} qat_start_step:{args.qat_start_step}"
+        f"qat_scheme:{args.qat_scheme} qat_start_step:{args.qat_start_step} "
+        f"moe_num_experts:{args.moe_num_experts} moe_every_n:{args.moe_every_n} "
+        f"moe_capacity_factor:{args.moe_capacity_factor} moe_aux_loss_coeff:{args.moe_aux_loss_coeff} "
+        f"num_moe_blocks:{base_model.num_moe_blocks}"
     )
     if base_model.use_recurrence:
         log0(
