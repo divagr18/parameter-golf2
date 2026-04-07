@@ -151,6 +151,11 @@ export MOE_AUX_LOSS_COEFF="${MOE_AUX_LOSS_COEFF:-1e-3}"
 #   int4 uses a 3-stage progressive schedule (256→64→16 levels) to avoid spikes.
 export QAT_SCHEME="${QAT_SCHEME:-none}"
 export QAT_START_STEP="${QAT_START_STEP:-9000}"
+# QAT_LSQ=1 enables Learned Step-Size Quantization: per-row learnable
+# log-scale trained through STE during QAT, then exported as the int4/int8
+# packing scale (no extra eval-time cost). Targets ~0.025 quant penalty
+# vs ~0.054 for baseline progressive QAT.
+export QAT_LSQ="${QAT_LSQ:-0}"
 
 # Optional hybrid SSM blocks: replace every Nth attention block with an SSM-style mixer.
 export USE_SSM="${USE_SSM:-0}"
@@ -249,7 +254,7 @@ echo "model:          dim=${MODEL_DIM} layers=${NUM_LAYERS} heads=${NUM_HEADS} k
 echo "recurrence:     core=${RECURRENT_CORE_LAYERS} steps=${RECURRENT_STEPS}  [FIX: was 3×6]"
 echo "use_swiglu:     ${USE_SWIGLU}"
 echo "moe:            experts=${MOE_NUM_EXPERTS} every_n=${MOE_EVERY_N} cap=${MOE_CAPACITY_FACTOR} aux=${MOE_AUX_LOSS_COEFF}"
-echo "qat:            scheme=${QAT_SCHEME} start_step=${QAT_START_STEP}"
+echo "qat:            scheme=${QAT_SCHEME} start_step=${QAT_START_STEP} lsq=${QAT_LSQ}"
 echo "use_ssm:        ${USE_SSM} (every_n=${SSM_EVERY_N} expand=${SSM_EXPAND} kernel=${SSM_KERNEL})"
 echo "use_mtp:        ${MTP_ENABLED} (steps=${MTP_STEPS} weight=${MTP_WEIGHT} decay=${MTP_DECAY} tie=${MTP_TIE_EMBEDDINGS} lr=${MTP_LR})"
 echo "distill:        ${DISTILL_ENABLED} (start_frac=${DISTILL_START_FRAC} weight=${DISTILL_WEIGHT} temp=${DISTILL_TEMP} ema=${DISTILL_EMA_DECAY})"

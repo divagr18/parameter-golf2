@@ -136,6 +136,10 @@ class Hyperparameters:
     # For 1-GPU ~6500-step runs: 4500. For 8-GPU ~13500-step runs: 9000.
     qat_scheme = os.environ.get("QAT_SCHEME", "none").strip().lower()
     qat_start_step = int(os.environ.get("QAT_START_STEP", "9000"))
+    # QAT_LSQ=1 enables Learned Step-Size Quantization: per-row learnable log-scale
+    # replaces the max-abs scale in fake-quant, reducing int4 roundtrip penalty by
+    # letting the model optimise the clip threshold per output row via backprop (STE).
+    qat_lsq = bool(int(os.environ.get("QAT_LSQ", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -509,19 +513,24 @@ def ordered_state_dict_items(state_dict: dict[str, Tensor], mode: str) -> list[t
         return sorted(items, key=lambda kv: (str(kv[1].dtype), kv[0]))
     raise ValueError(f"Unsupported WEIGHT_ORDER={mode!r}; expected one of {sorted(SUPPORTED_WEIGHT_ORDERS)}")
 
-def quantize_float_tensor_int8(t: Tensor) -> tuple[Tensor, Tensor, dict[str, object] | None]:
+def quantize_float_tensor_int8(
+    t: Tensor, precomputed_scale: Tensor | None = None
+) -> tuple[Tensor, Tensor, dict[str, object] | None]:
     t32 = t.float()
     if t32.ndim == 2:
         # Matrices get one scale per row, which usually tracks output-channel
         # ranges much better than a single tensor-wide scale.
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        if precomputed_scale is not None:
+            # LSQ-learned scale: use directly, skip the quantile clip computation.
+            scale = precomputed_scale.float().clamp_min(1.0 / 127.0)
+        else:
+            clip_abs = (
+                torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+                if t32.numel()
+                else torch.empty((t32.shape[0],), dtype=torch.float32)
+            )
+            scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        q = torch.clamp(torch.round(t32 / scale[:, None]), -127, 127).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), {"scheme": "int8_per_row", "axis": 0}
 
     # Vectors / scalars use a simpler per-tensor scale.
@@ -547,17 +556,22 @@ def unpack_int4_signed(packed: Tensor, numel: int) -> Tensor:
     out[1::2] = high
     return out[:numel].to(dtype=torch.int8).contiguous()
 
-def quantize_float_tensor_int4(t: Tensor) -> tuple[Tensor, Tensor, dict[str, object]]:
+def quantize_float_tensor_int4(
+    t: Tensor, precomputed_scale: Tensor | None = None
+) -> tuple[Tensor, Tensor, dict[str, object]]:
     t32 = t.float()
     if t32.ndim == 2:
-        clip_abs = (
-            torch.quantile(t32.abs(), INT4_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / 7.0).clamp_min(1.0 / 7.0)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -8, 7).to(torch.int8)
+        if precomputed_scale is not None:
+            # LSQ-learned scale: skip quantile, use directly.
+            scale = precomputed_scale.float().clamp_min(1.0 / 7.0)
+        else:
+            clip_abs = (
+                torch.quantile(t32.abs(), INT4_CLIP_Q, dim=1)
+                if t32.numel()
+                else torch.empty((t32.shape[0],), dtype=torch.float32)
+            )
+            scale = (clip_abs / 7.0).clamp_min(1.0 / 7.0)
+        q = torch.clamp(torch.round(t32 / scale[:, None]), -8, 7).to(torch.int8)
         packed = pack_int4_signed(q)
         return (
             packed,
@@ -575,6 +589,7 @@ def quantize_state_dict(
     scheme: str = "int8",
     weight_order: str = "none",
     mixed_low_precision_scheme: str = "int8",
+    precomputed_scales: dict[str, Tensor] | None = None,
 ):
     if scheme not in SUPPORTED_QUANT_SCHEMES:
         raise ValueError(f"Unsupported QUANT_SCHEME={scheme!r}; expected one of {sorted(SUPPORTED_QUANT_SCHEMES)}")
@@ -645,10 +660,15 @@ def quantize_state_dict(
             continue
 
         stats["num_float_tensors"] += 1
+        pre_scale = None
+        if precomputed_scales is not None and t.ndim == 2:
+            pre_scale = precomputed_scales.get(name)
+            if pre_scale is not None and pre_scale.shape[0] != t.shape[0]:
+                pre_scale = None  # shape mismatch → fall back to quantile
         if active_scheme == "int8":
-            q, s, meta = quantize_float_tensor_int8(t)
+            q, s, meta = quantize_float_tensor_int8(t, precomputed_scale=pre_scale)
         else:
-            q, s, meta = quantize_float_tensor_int4(t)
+            q, s, meta = quantize_float_tensor_int4(t, precomputed_scale=pre_scale)
         if meta:
             qmeta[name] = meta
         quantized[name] = q
@@ -857,17 +877,89 @@ def _fake_quantize_row(w: Tensor, levels: int) -> Tensor:
     return (w_ste * scale.unsqueeze(1)).to(w.dtype)
 
 
+def _fake_quantize_row_lsq(w: Tensor, levels: int, log_scale: Tensor) -> Tensor:
+    """LSQ variant: per-row learnable step-size quantisation with STE.
+
+    Based on "Learned Step Size Quantization" (Esser et al., 2019).
+    log_scale is a learnable 1D parameter [out_features] optimised via backprop.
+    Gradient on log_scale is scaled by g = 1/sqrt(numel_per_row * half) per the LSQ paper,
+    which keeps the scale-gradient magnitude commensurate with weight-gradient magnitude.
+
+    Compared to max-abs fake-quant, LSQ lets the model adapt the clip threshold per row,
+    reducing int4 quantisation error by ~30-50% on typical models.
+    """
+    half = float(levels // 2 - (1 if levels == 16 else 0))
+    w32 = w.float()
+    # LSQ gradient scaling trick: effective gradient on log_scale is g * d_loss/d_scale.
+    numel_per_row = float(w32.shape[1])
+    g = 1.0 / math.sqrt(max(numel_per_row * half, 1.0))
+    ls_grad_scaled = log_scale * g + (log_scale - log_scale * g).detach()
+    # Convert log-scale to positive scale via exp (auto-positive, stable).
+    scale = ls_grad_scaled.float().exp().clamp_min(1e-8)
+    w_scaled = (w32 / scale.unsqueeze(1)).clamp(-half, half)
+    w_ste = w_scaled + (w_scaled.round() - w_scaled).detach()
+    return (w_ste * scale.unsqueeze(1)).to(w.dtype)
+
+
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     # QAT: set qat_levels to 256 (int8) or 16 (int4) to enable fake-quantisation.
     qat_levels: int = 0   # class-level switch updated from the training loop
+    # LSQ: when True, CastedLinear instances allocate a learnable per-row log-scale parameter
+    # used in place of the max-abs scale. Must be set BEFORE model construction.
+    qat_lsq_enabled: bool = False
+
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, **kwargs) -> None:
+        super().__init__(in_features, out_features, bias=bias, **kwargs)
+        if __class__.qat_lsq_enabled:
+            # Per-row log-scale. Zeros → scale=1.0 placeholder; re-initialised from actual
+            # weight stats at the step QAT first activates (see init_lsq_scales below).
+            self.qat_log_scale = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.qat_log_scale = None
 
     def forward(self, x: Tensor) -> Tensor:
         w = self.weight
         if __class__.qat_levels > 0 and w.ndim == 2:
-            w = _fake_quantize_row(w, __class__.qat_levels)
+            if self.qat_log_scale is not None:
+                w = _fake_quantize_row_lsq(w, __class__.qat_levels, self.qat_log_scale)
+            else:
+                w = _fake_quantize_row(w, __class__.qat_levels)
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, w.to(x.dtype), bias)
+
+
+def init_lsq_scales(model: nn.Module, levels: int) -> int:
+    """Initialise LSQ per-row log-scales from current weight statistics.
+
+    Called once when QAT first activates. Sets each log_scale to
+    log(max_abs_per_row / half), matching the initial value a max-abs fake-quant would use.
+    Returns the number of CastedLinear modules initialised.
+    """
+    half = float(levels // 2 - (1 if levels == 16 else 0))
+    count = 0
+    with torch.no_grad():
+        for m in model.modules():
+            if isinstance(m, CastedLinear) and m.qat_log_scale is not None and m.weight.ndim == 2:
+                w32 = m.weight.detach().float()
+                scale_val = (w32.abs().amax(dim=1).clamp_min(1e-6) / max(half, 1.0))
+                m.qat_log_scale.data.copy_(scale_val.log().to(m.qat_log_scale.dtype))
+                count += 1
+    return count
+
+
+def collect_lsq_scales(model: nn.Module, prefix: str = "") -> dict[str, Tensor]:
+    """Walk the model and return a dict of {state_dict_weight_name: exp(log_scale)}.
+
+    Used at export time to plumb LSQ-learned scales into quantize_float_tensor_int4/int8
+    via the precomputed_scales dict.
+    """
+    scales: dict[str, Tensor] = {}
+    for name, m in model.named_modules(prefix=prefix):
+        if isinstance(m, CastedLinear) and m.qat_log_scale is not None and m.weight.ndim == 2:
+            key = f"{name}.weight" if name else "weight"
+            scales[key] = m.qat_log_scale.detach().float().exp().clamp_min(1e-8).cpu()
+    return scales
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -1863,6 +1955,10 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
+    # Enable LSQ fake-quant allocation on CastedLinear BEFORE model construction so
+    # each CastedLinear gains a per-row learnable qat_log_scale parameter automatically.
+    CastedLinear.qat_lsq_enabled = bool(args.qat_lsq)
+
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
@@ -1928,7 +2024,8 @@ def main() -> None:
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if (p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS))
+        and not name.endswith("qat_log_scale")
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
@@ -2025,6 +2122,27 @@ def main() -> None:
             fused=autocast_enabled,
         )
         optimizers.insert(1, optimizer_head)
+
+    # Dedicated optimizer for LSQ per-row log_scale parameters across the WHOLE model.
+    # These are 1D learnable steps inside every CastedLinear (blocks + lm_head + bigram + ...),
+    # not all of which would otherwise land in scalar_params (which only walks blocks).
+    if args.qat_lsq:
+        lsq_params: list[nn.Parameter] = [
+            m.qat_log_scale
+            for m in base_model.modules()
+            if isinstance(m, CastedLinear) and m.qat_log_scale is not None
+        ]
+        if lsq_params:
+            lsq_lr = float(os.environ.get("QAT_LSQ_LR", str(args.scalar_lr)))
+            optimizer_lsq = torch.optim.Adam(
+                [{"params": lsq_params, "lr": lsq_lr, "base_lr": lsq_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                fused=autocast_enabled,
+            )
+            optimizers.append(optimizer_lsq)
+            if master_process:
+                log0(f"qat_lsq: optimizer params={len(lsq_params)} lr={lsq_lr}")
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -2232,8 +2350,16 @@ def main() -> None:
                 frac = qat_elapsed / qat_window
                 target_levels = 256 if frac < 0.33 else (64 if frac < 0.67 else 16)
             if CastedLinear.qat_levels != target_levels:
+                prev_levels = CastedLinear.qat_levels
                 CastedLinear.qat_levels = target_levels
                 log0(f"qat: {'enabled' if target_levels > 0 else 'disabled'} levels:{target_levels} step:{step}")
+                # LSQ: on the transition from 0 → nonzero, seed per-row log-scales from
+                # the current weight statistics (max-abs / half). Also reseed on each
+                # progressive level change so the learned scales start from a valid grid
+                # for the new quantisation resolution.
+                if args.qat_lsq and target_levels > 0 and prev_levels != target_levels:
+                    n_lsq = init_lsq_scales(base_model, target_levels)
+                    log0(f"qat: lsq_init count:{n_lsq} levels:{target_levels}")
 
         # Sequence length curriculum: ramp from curriculum_min_seq_len → train_seq_len.
         if args.curriculum_enabled and step < args.curriculum_steps:
@@ -2372,11 +2498,27 @@ def main() -> None:
             )
 
     resolved_compressor, compressor_note = resolve_compressor(args.compressor)
+    # LSQ export plumbing: collect learned per-row scales and strip the log_scale
+    # parameters from the state_dict (not needed at inference; dequantised weights
+    # are used directly). The collected scales are passed to the quantiser so it
+    # uses the LSQ-optimised scale instead of the quantile-derived one.
+    export_state_dict = base_model.state_dict()
+    lsq_scales_export: dict[str, Tensor] | None = None
+    if args.qat_lsq:
+        lsq_scales_export = collect_lsq_scales(base_model)
+        # Drop every *.qat_log_scale entry from the state_dict so it doesn't
+        # bloat the passthrough payload.
+        export_state_dict = {
+            k: v for k, v in export_state_dict.items() if not k.endswith(".qat_log_scale")
+        }
+        if master_process:
+            log0(f"qat_lsq: collected {len(lsq_scales_export)} per-row scales for export")
     quant_obj, quant_stats = quantize_state_dict(
-        base_model.state_dict(),
+        export_state_dict,
         scheme=args.quant_scheme,
         weight_order=args.weight_order,
         mixed_low_precision_scheme=args.mixed_low_precision_scheme,
+        precomputed_scales=lsq_scales_export,
     )
     artifact_name = export_artifact_name(args.quant_scheme, resolved_compressor)
     quant_buf = io.BytesIO()
@@ -2442,6 +2584,9 @@ def main() -> None:
     if args.final_roundtrip_eval:
         if distributed:
             dist.barrier()
+        # Disable QAT fake-quant during roundtrip eval so loaded dequantized
+        # weights are not re-fake-quantized through stale LSQ scales.
+        CastedLinear.qat_levels = 0
         with open(artifact_name, "rb") as f:
             quant_blob_disk = f.read()
         quant_state = torch.load(
@@ -2449,7 +2594,7 @@ def main() -> None:
             map_location="cpu",
             weights_only=True,
         )
-        base_model.load_state_dict(dequantize_state_dict(quant_state), strict=True)
+        base_model.load_state_dict(dequantize_state_dict(quant_state), strict=False)
         if device.type == "cuda":
             torch.cuda.synchronize()
         t_qeval = time.perf_counter()
