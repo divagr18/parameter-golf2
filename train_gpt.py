@@ -73,6 +73,19 @@ class Hyperparameters:
     # NTK-aware RoPE scaling at eval: new_base = rope_base * eval_rope_scale^(head_dim/(head_dim-2)).
     # Suggested: eval_rope_scale = (eval_seq_len / train_seq_len) ** 2  (≈4 for 2× context)
     eval_rope_scale = float(os.environ.get("EVAL_ROPE_SCALE", "1.0"))
+    # Optional extra eval contexts to sweep at the end of a run. These do not affect the
+    # in-training validation path unless promoted to the primary eval context via EVAL_SEQ_LEN.
+    eval_sweep_seq_lens = os.environ.get("EVAL_SWEEP_SEQ_LENS", "").strip()
+    eval_sweep_rope_scales = os.environ.get("EVAL_SWEEP_ROPE_SCALES", "").strip()
+    # Multi-context eval blend: evaluate multiple contexts on the same scored token blocks and
+    # blend their token probabilities. Set FINAL_EVAL_MODE=blend to make this the official score.
+    eval_blend_seq_lens = os.environ.get("EVAL_BLEND_SEQ_LENS", "").strip()
+    eval_blend_rope_scales = os.environ.get("EVAL_BLEND_ROPE_SCALES", "").strip()
+    eval_blend_weights = os.environ.get("EVAL_BLEND_WEIGHTS", "").strip()
+    # 0 = inherit EVAL_STRIDE_FRAC. Otherwise, use this stride fraction for the common scored span.
+    eval_blend_stride_frac = float(os.environ.get("EVAL_BLEND_STRIDE_FRAC", "0.0"))
+    # primary | blend
+    final_eval_mode = os.environ.get("FINAL_EVAL_MODE", "primary").strip().lower()
     # Low-rank bigram logit bias: learnable rank-r factored bigram table.
     # bigram_bias[i] = bigram_right(bigram_left(prev_token[i]))  added to logits before softcap.
     # 0 = disabled.  32 costs ~64K int8 params (≈32 KB), well within the 164 KB headroom.
@@ -99,6 +112,11 @@ class Hyperparameters:
     # Research-confirmed ~0.5-1.5% BPB improvement, especially helps quantization quality.
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_collect_every = int(os.environ.get("SWA_COLLECT_EVERY", "10"))
+    # Optional train-side loss mask aligned to sliding-window eval. When enabled, only the
+    # suffix of each training chunk contributes loss, matching the eval metric more closely.
+    train_loss_mask_enabled = bool(int(os.environ.get("TRAIN_LOSS_MASK_ENABLED", "0")))
+    # 0 = inherit EVAL_STRIDE_FRAC.
+    train_loss_mask_stride_frac = float(os.environ.get("TRAIN_LOSS_MASK_STRIDE_FRAC", "0.0"))
     # Sequence length curriculum: ramp seq_len from curriculum_min_seq_len → train_seq_len
     # over the first curriculum_steps training steps.  Faster early convergence on local patterns.
     curriculum_enabled = bool(int(os.environ.get("CURRICULUM_ENABLED", "0")))
@@ -331,7 +349,211 @@ def load_validation_tokens(pattern: str, seq_len: int) -> Tensor:
     return tokens[: usable + 1]
 
 
-def eval_val(
+def parse_csv_ints(raw: str) -> list[int]:
+    values: list[int] = []
+    for part in raw.split(","):
+        item = part.strip()
+        if item:
+            values.append(int(item))
+    return values
+
+
+def parse_csv_floats(raw: str) -> list[float]:
+    values: list[float] = []
+    for part in raw.split(","):
+        item = part.strip()
+        if item:
+            values.append(float(item))
+    return values
+
+
+def default_eval_rope_scale(seq_len: int, train_seq_len: int) -> float:
+    if seq_len == train_seq_len:
+        return 1.0
+    return float(seq_len / train_seq_len) ** 2
+
+
+def resolve_seq_len(raw_seq_len: int, train_seq_len: int) -> int:
+    return train_seq_len if raw_seq_len <= 0 else raw_seq_len
+
+
+def resolve_stride(seq_len: int, stride_frac: float) -> int:
+    frac = stride_frac if stride_frac > 0.0 else 1.0
+    return max(1, min(seq_len, int(seq_len * frac)))
+
+
+def build_loss_mask_cpu(seq_len: int, stride_frac: float) -> tuple[Tensor, int, int]:
+    stride = resolve_stride(seq_len, stride_frac)
+    prefix_len = seq_len - stride
+    loss_mask_cpu = torch.zeros(seq_len, dtype=torch.float32)
+    loss_mask_cpu[prefix_len:] = 1.0
+    return loss_mask_cpu, prefix_len, stride
+
+
+def format_float_tag(value: float) -> str:
+    text = f"{value:.4f}".rstrip("0").rstrip(".")
+    return text.replace("-", "m").replace(".", "p") if text else "0"
+
+
+def make_eval_spec_name(seq_len: int, rope_scale: float) -> str:
+    return f"seq{seq_len}_rope{format_float_tag(rope_scale)}"
+
+
+def resolve_primary_eval_spec(args: Hyperparameters) -> tuple[str, int, float]:
+    seq_len = resolve_seq_len(args.eval_seq_len, args.train_seq_len)
+    rope_scale = float(args.eval_rope_scale)
+    return "primary", seq_len, rope_scale
+
+
+def resolve_eval_sweep_specs(args: Hyperparameters) -> list[tuple[str, int, float]]:
+    specs: list[tuple[str, int, float]] = []
+    seen: set[tuple[int, int]] = set()
+
+    def add_spec(name: str, seq_len: int, rope_scale: float) -> None:
+        key = (seq_len, int(round(rope_scale * 1_000_000)))
+        if key in seen:
+            return
+        seen.add(key)
+        specs.append((name, seq_len, rope_scale))
+
+    primary_name, primary_seq_len, primary_rope_scale = resolve_primary_eval_spec(args)
+    add_spec(primary_name, primary_seq_len, primary_rope_scale)
+
+    sweep_seq_lens = parse_csv_ints(args.eval_sweep_seq_lens)
+    sweep_rope_scales = parse_csv_floats(args.eval_sweep_rope_scales)
+    if sweep_rope_scales and len(sweep_rope_scales) != len(sweep_seq_lens):
+        raise ValueError(
+            "EVAL_SWEEP_ROPE_SCALES must have the same number of entries as EVAL_SWEEP_SEQ_LENS"
+        )
+    for idx, raw_seq_len in enumerate(sweep_seq_lens):
+        seq_len = resolve_seq_len(raw_seq_len, args.train_seq_len)
+        rope_scale = (
+            sweep_rope_scales[idx]
+            if sweep_rope_scales
+            else default_eval_rope_scale(seq_len, args.train_seq_len)
+        )
+        add_spec(make_eval_spec_name(seq_len, rope_scale), seq_len, float(rope_scale))
+    return specs
+
+
+def resolve_eval_blend_specs(args: Hyperparameters) -> tuple[list[tuple[str, int, float]], list[float]]:
+    blend_seq_lens = parse_csv_ints(args.eval_blend_seq_lens)
+    if not blend_seq_lens:
+        return [], []
+    blend_rope_scales = parse_csv_floats(args.eval_blend_rope_scales)
+    if blend_rope_scales and len(blend_rope_scales) != len(blend_seq_lens):
+        raise ValueError(
+            "EVAL_BLEND_ROPE_SCALES must have the same number of entries as EVAL_BLEND_SEQ_LENS"
+        )
+    blend_weights = parse_csv_floats(args.eval_blend_weights)
+    if blend_weights and len(blend_weights) != len(blend_seq_lens):
+        raise ValueError(
+            "EVAL_BLEND_WEIGHTS must have the same number of entries as EVAL_BLEND_SEQ_LENS"
+        )
+
+    specs: list[tuple[str, int, float]] = []
+    for idx, raw_seq_len in enumerate(blend_seq_lens):
+        seq_len = resolve_seq_len(raw_seq_len, args.train_seq_len)
+        rope_scale = (
+            blend_rope_scales[idx]
+            if blend_rope_scales
+            else default_eval_rope_scale(seq_len, args.train_seq_len)
+        )
+        specs.append((make_eval_spec_name(seq_len, float(rope_scale)), seq_len, float(rope_scale)))
+
+    if not blend_weights:
+        blend_weights = [1.0] * len(specs)
+    total_weight = sum(blend_weights)
+    if total_weight <= 0.0:
+        raise ValueError("EVAL_BLEND_WEIGHTS must sum to a positive value")
+    normalized = [w / total_weight for w in blend_weights]
+    return specs, normalized
+
+
+def resolve_max_eval_seq_len(
+    args: Hyperparameters,
+    sweep_specs: list[tuple[str, int, float]],
+    blend_specs: list[tuple[str, int, float]],
+) -> int:
+    max_seq_len = args.train_seq_len
+    for _, seq_len, _ in sweep_specs:
+        max_seq_len = max(max_seq_len, seq_len)
+    for _, seq_len, _ in blend_specs:
+        max_seq_len = max(max_seq_len, seq_len)
+    return max_seq_len
+
+
+def resolve_train_loss_mask_stride_frac(args: Hyperparameters) -> float:
+    return args.train_loss_mask_stride_frac if args.train_loss_mask_stride_frac > 0.0 else args.eval_stride_frac
+
+
+def get_eval_model(model: nn.Module) -> nn.Module:
+    raw_model = model.module if hasattr(model, "module") else model
+    if hasattr(raw_model, "forward_logits"):
+        return raw_model
+    if hasattr(raw_model, "_orig_mod") and hasattr(raw_model._orig_mod, "forward_logits"):
+        return raw_model._orig_mod
+    raise AttributeError("Could not find a forward_logits-capable model for evaluation")
+
+
+def apply_eval_rope_scaling(
+    model: nn.Module,
+    args: Hyperparameters,
+    seq_len: int,
+    rope_scale: float,
+) -> list[tuple[object, Tensor]]:
+    if rope_scale == 1.0 and seq_len == args.train_seq_len:
+        return []
+    head_dim = args.model_dim // args.num_heads
+    ntk_factor = rope_scale ** (head_dim / max(head_dim - 2, 1))
+    raw_model = get_eval_model(model)
+    orig_rope_bases: list[tuple[object, Tensor]] = []
+    for block in raw_model.blocks:
+        attn = getattr(block, "attn", None)
+        rot = getattr(attn, "rotary", None)
+        if rot is None:
+            continue
+        orig_rope_bases.append((rot, rot.inv_freq.clone()))
+        new_base = args.rope_base * ntk_factor
+        new_inv_freq = 1.0 / (
+            new_base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=rot.inv_freq.device) / head_dim)
+        )
+        rot.inv_freq = new_inv_freq
+        rot._cos_cached = None
+    return orig_rope_bases
+
+
+def restore_eval_rope_scaling(orig_rope_bases: list[tuple[object, Tensor]]) -> None:
+    for rot, orig_inv_freq in orig_rope_bases:
+        rot.inv_freq = orig_inv_freq
+        rot._cos_cached = None
+
+
+def forward_eval_log_probs(
+    args: Hyperparameters,
+    model: nn.Module,
+    x: Tensor,
+    seq_len: int,
+    rope_scale: float,
+    autocast_enabled: bool,
+) -> Tensor:
+    eval_model = get_eval_model(model)
+    orig_rope_bases = apply_eval_rope_scaling(model, args, seq_len, rope_scale)
+    try:
+        if autocast_enabled:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                logits = eval_model.forward_logits(x)
+        else:
+            logits = eval_model.forward_logits(x)
+    finally:
+        restore_eval_rope_scaling(orig_rope_bases)
+    log_probs = logits.float().reshape(x.size(0), x.size(1), -1)
+    if not bool(getattr(eval_model, "copy_cache_enabled", False)):
+        log_probs = F.log_softmax(log_probs, dim=-1)
+    return log_probs
+
+
+def eval_val_single(
     args: Hyperparameters,
     model: nn.Module,
     rank: int,
@@ -343,39 +565,11 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    seq_len: int,
+    rope_scale: float,
+    stride_frac: float,
 ) -> tuple[float, float]:
-    # Validation computes two metrics:
-    # - val_loss: token cross-entropy (natural log)
-    # - val_bpb: tokenizer-agnostic compression metric used by the challenge
-    #
-    # Sliding window: EVAL_STRIDE_FRAC < 1.0 uses overlapping windows so every scored
-    # token has at least (1 - stride_frac) * seq_len tokens of prior context, which
-    # significantly reduces the high-loss predictions at chunk boundaries.
-    # Long-context: EVAL_SEQ_LEN > 0 evaluates at a longer context window.  Pair with
-    # EVAL_ROPE_SCALE to apply NTK-aware RoPE base scaling for cleaner length extrapolation.
-    seq_len = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
-    stride = max(1, int(seq_len * args.eval_stride_frac))
-    prefix_len = seq_len - stride  # tokens at window start that are context-only (not scored)
-
-    # Pre-build the per-position loss mask (1 = scored, 0 = context-only prefix).
-    # Shape [seq_len]; will be expanded to [batch, seq_len] per batch.
-    loss_mask_cpu = torch.zeros(seq_len, dtype=torch.float32)
-    loss_mask_cpu[prefix_len:] = 1.0
-
-    # Temporarily rescale RoPE base for long-context eval using NTK-aware interpolation.
-    # new_base = rope_base * scale^(head_dim / (head_dim - 2))
-    _orig_rope_bases: list[tuple] = []
-    if args.eval_rope_scale != 1.0 or seq_len != args.train_seq_len:
-        head_dim = args.model_dim // args.num_heads
-        ntk_factor = args.eval_rope_scale ** (head_dim / max(head_dim - 2, 1))
-        raw_model = model.module if hasattr(model, "module") else model
-        for block in raw_model.blocks:
-            rot = block.attn.rotary
-            _orig_rope_bases.append((rot, rot.inv_freq.clone()))
-            new_base = args.rope_base * ntk_factor
-            new_inv_freq = 1.0 / (new_base ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=rot.inv_freq.device) / head_dim))
-            rot.inv_freq = new_inv_freq
-            rot._cos_cached = None  # invalidate cache
+    _, prefix_len, stride = build_loss_mask_cpu(seq_len, stride_frac)
 
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     local_batch_seqs = max(1, local_batch_tokens // seq_len)
@@ -398,26 +592,18 @@ def eval_val(
                 ys.append(val_tokens[s + 1 : s + seq_len + 1])
             x = torch.stack(xs).to(device=device, dtype=torch.int64, non_blocking=True)
             y = torch.stack(ys).to(device=device, dtype=torch.int64, non_blocking=True)
-            mask = loss_mask_cpu.unsqueeze(0).expand(x.size(0), -1).to(device=device)
-            if autocast_enabled:
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    batch_loss = model(x, y, loss_mask=mask).detach()
-            else:
-                batch_loss = model(x, y, loss_mask=mask).detach()
-            scored_tokens = int(mask.sum().item())
-            val_loss_sum += batch_loss.to(torch.float64) * scored_tokens
-            val_token_count += scored_tokens
-            # Byte counting: only for scored (non-prefix) positions
+            log_probs = forward_eval_log_probs(args, model, x, seq_len, rope_scale, autocast_enabled)
+            scored_log_probs = log_probs[:, prefix_len:, :]
+            scored_targets = y[:, prefix_len:]
+            target_log_probs = scored_log_probs.gather(-1, scored_targets.unsqueeze(-1)).squeeze(-1)
+            val_loss_sum += (-target_log_probs).sum(dtype=torch.float64)
+            val_token_count += target_log_probs.numel()
+
             prev_ids = x[:, prefix_len:].reshape(-1)
-            tgt_ids = y[:, prefix_len:].reshape(-1)
+            tgt_ids = scored_targets.reshape(-1)
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
-
-    # Restore original RoPE bases
-    for rot, orig_inv_freq in _orig_rope_bases:
-        rot.inv_freq = orig_inv_freq
-        rot._cos_cached = None
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -429,6 +615,238 @@ def eval_val(
     tokens_per_byte = val_token_count.item() / val_byte_count.item()
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val_blend(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    autocast_enabled: bool,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    blend_specs: list[tuple[str, int, float]],
+    blend_weights: list[float],
+) -> tuple[float, float]:
+    if not blend_specs:
+        raise ValueError("eval_val_blend requires at least one blend spec")
+
+    blend_stride_frac = args.eval_blend_stride_frac if args.eval_blend_stride_frac > 0.0 else args.eval_stride_frac
+    min_seq_len = min(seq_len for _, seq_len, _ in blend_specs)
+    max_seq_len = max(seq_len for _, seq_len, _ in blend_specs)
+    blend_stride = resolve_stride(min_seq_len, blend_stride_frac)
+    max_prefix_len = max(seq_len - blend_stride for _, seq_len, _ in blend_specs)
+    first_target_pos = max_prefix_len + 1
+    max_target_start = val_tokens.numel() - blend_stride
+    if max_target_start < first_target_pos:
+        raise ValueError(
+            f"Validation split is too short for blend eval: first_target_pos={first_target_pos}, "
+            f"max_target_start={max_target_start}"
+        )
+
+    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    local_batch_chunks = max(1, local_batch_tokens // max(max_seq_len * len(blend_specs), 1))
+    total_chunks = ((max_target_start - first_target_pos) // blend_stride) + 1
+    chunk_start = (total_chunks * rank) // world_size
+    chunk_end = (total_chunks * (rank + 1)) // world_size
+
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    log_weights = [math.log(max(weight, 1e-12)) for weight in blend_weights]
+
+    model.eval()
+    with torch.inference_mode():
+        for batch_chunk_start in range(chunk_start, chunk_end, local_batch_chunks):
+            batch_chunk_end = min(batch_chunk_start + local_batch_chunks, chunk_end)
+            target_starts = [first_target_pos + idx * blend_stride for idx in range(batch_chunk_start, batch_chunk_end)]
+
+            common_prev_ids = torch.stack(
+                [val_tokens[target_pos - 1 : target_pos + blend_stride - 1] for target_pos in target_starts]
+            ).to(device=device, dtype=torch.int64, non_blocking=True)
+            common_target_ids = torch.stack(
+                [val_tokens[target_pos : target_pos + blend_stride] for target_pos in target_starts]
+            ).to(device=device, dtype=torch.int64, non_blocking=True)
+
+            blend_log_probs: Tensor | None = None
+            for (spec_name, seq_len, rope_scale), log_weight in zip(blend_specs, log_weights, strict=True):
+                del spec_name
+                prefix_len = seq_len - blend_stride
+                xs = []
+                for target_pos in target_starts:
+                    s = target_pos - prefix_len - 1
+                    xs.append(val_tokens[s : s + seq_len])
+                x = torch.stack(xs).to(device=device, dtype=torch.int64, non_blocking=True)
+                log_probs = forward_eval_log_probs(args, model, x, seq_len, rope_scale, autocast_enabled)
+                scored_log_probs = log_probs[:, prefix_len:, :]
+                weighted_log_probs = scored_log_probs + log_weight
+                blend_log_probs = (
+                    weighted_log_probs
+                    if blend_log_probs is None
+                    else torch.logaddexp(blend_log_probs, weighted_log_probs)
+                )
+
+            if blend_log_probs is None:
+                raise RuntimeError("blend_log_probs should have been populated")
+            target_log_probs = blend_log_probs.gather(-1, common_target_ids.unsqueeze(-1)).squeeze(-1)
+            val_loss_sum += (-target_log_probs).sum(dtype=torch.float64)
+            val_token_count += target_log_probs.numel()
+
+            prev_ids = common_prev_ids.reshape(-1)
+            tgt_ids = common_target_ids.reshape(-1)
+            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+            val_byte_count += token_bytes.to(torch.float64).sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    model.train()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
+
+
+def eval_val(
+    args: Hyperparameters,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    autocast_enabled: bool,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    _, seq_len, rope_scale = resolve_primary_eval_spec(args)
+    return eval_val_single(
+        args,
+        model,
+        rank,
+        world_size,
+        device,
+        autocast_enabled,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+        seq_len,
+        rope_scale,
+        args.eval_stride_frac,
+    )
+
+
+def run_final_eval_suite(
+    args: Hyperparameters,
+    roundtrip_tag: str,
+    model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    autocast_enabled: bool,
+    grad_accum_steps: int,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    sweep_specs: list[tuple[str, int, float]],
+    blend_specs: list[tuple[str, int, float]],
+    blend_weights: list[float],
+    log0,
+) -> tuple[float, float]:
+    primary_name, primary_seq_len, primary_rope_scale = resolve_primary_eval_spec(args)
+    primary_val_loss, primary_val_bpb = eval_val_single(
+        args,
+        model,
+        rank,
+        world_size,
+        device,
+        autocast_enabled,
+        grad_accum_steps,
+        val_tokens,
+        base_bytes_lut,
+        has_leading_space_lut,
+        is_boundary_token_lut,
+        primary_seq_len,
+        primary_rope_scale,
+        args.eval_stride_frac,
+    )
+    log0(
+        f"{roundtrip_tag}_ctx_exact name:{primary_name} seq_len:{primary_seq_len} "
+        f"rope_scale:{primary_rope_scale:.4f} stride_frac:{args.eval_stride_frac:.4f} "
+        f"val_loss:{primary_val_loss:.8f} val_bpb:{primary_val_bpb:.8f}"
+    )
+
+    for sweep_name, sweep_seq_len, sweep_rope_scale in sweep_specs[1:]:
+        sweep_val_loss, sweep_val_bpb = eval_val_single(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            autocast_enabled,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            sweep_seq_len,
+            sweep_rope_scale,
+            args.eval_stride_frac,
+        )
+        log0(
+            f"{roundtrip_tag}_ctx_exact name:{sweep_name} seq_len:{sweep_seq_len} "
+            f"rope_scale:{sweep_rope_scale:.4f} stride_frac:{args.eval_stride_frac:.4f} "
+            f"val_loss:{sweep_val_loss:.8f} val_bpb:{sweep_val_bpb:.8f}"
+        )
+
+    blend_result: tuple[float, float] | None = None
+    if blend_specs:
+        blend_stride_frac = args.eval_blend_stride_frac if args.eval_blend_stride_frac > 0.0 else args.eval_stride_frac
+        blend_val_loss, blend_val_bpb = eval_val_blend(
+            args,
+            model,
+            rank,
+            world_size,
+            device,
+            autocast_enabled,
+            grad_accum_steps,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+            blend_specs,
+            blend_weights,
+        )
+        blend_specs_log = ",".join(
+            f"{name}:{seq_len}@{rope_scale:.4f}"
+            for name, seq_len, rope_scale in blend_specs
+        )
+        blend_weights_log = ",".join(f"{weight:.6f}" for weight in blend_weights)
+        log0(
+            f"{roundtrip_tag}_blend_exact stride_frac:{blend_stride_frac:.4f} specs:{blend_specs_log} "
+            f"weights:{blend_weights_log} val_loss:{blend_val_loss:.8f} val_bpb:{blend_val_bpb:.8f}"
+        )
+        blend_result = (blend_val_loss, blend_val_bpb)
+
+    if args.final_eval_mode == "primary":
+        return primary_val_loss, primary_val_bpb
+    if args.final_eval_mode == "blend":
+        if blend_result is None:
+            raise ValueError("FINAL_EVAL_MODE=blend requires EVAL_BLEND_SEQ_LENS to be set")
+        return blend_result
+    raise ValueError(f"Unsupported FINAL_EVAL_MODE={args.final_eval_mode!r}; expected 'primary' or 'blend'")
 
 # -----------------------------
 # POST-TRAINING QUANTIZATION
@@ -1825,6 +2243,14 @@ def main() -> None:
         raise ValueError(
             f"Unsupported MIXED_LOW_PRECISION_SCHEME={args.mixed_low_precision_scheme!r}; expected 'int8' or 'int4'"
         )
+    sweep_specs = resolve_eval_sweep_specs(args)
+    blend_specs, blend_weights = resolve_eval_blend_specs(args)
+    max_eval_seq_len = resolve_max_eval_seq_len(args, sweep_specs, blend_specs)
+    train_loss_mask_stride_frac = resolve_train_loss_mask_stride_frac(args)
+    if args.final_eval_mode not in {"primary", "blend"}:
+        raise ValueError(f"Unsupported FINAL_EVAL_MODE={args.final_eval_mode!r}; expected 'primary' or 'blend'")
+    if args.final_eval_mode == "blend" and not blend_specs:
+        raise ValueError("FINAL_EVAL_MODE=blend requires EVAL_BLEND_SEQ_LENS to be set")
 
     # -----------------------------
     # DISTRIBUTED + DEVICE SETUP
@@ -1958,12 +2384,12 @@ def main() -> None:
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
-    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    val_tokens = load_validation_tokens(args.val_files, max_eval_seq_len)
     if args.val_max_tokens > 0:
-        usable = (min(args.val_max_tokens, val_tokens.numel() - 1) // args.train_seq_len) * args.train_seq_len
+        usable = (min(args.val_max_tokens, val_tokens.numel() - 1) // max_eval_seq_len) * max_eval_seq_len
         if usable <= 0:
             raise ValueError(
-                f"VAL_MAX_TOKENS={args.val_max_tokens} is too small for TRAIN_SEQ_LEN={args.train_seq_len}"
+                f"VAL_MAX_TOKENS={args.val_max_tokens} is too small for MAX_EVAL_SEQ_LEN={max_eval_seq_len}"
             )
         val_tokens = val_tokens[: usable + 1].contiguous()
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
@@ -1974,6 +2400,32 @@ def main() -> None:
     log0(
         f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1} "
         f"val_max_tokens:{args.val_max_tokens if args.val_max_tokens > 0 else 'full'}"
+    )
+    _, primary_eval_seq_len, primary_eval_rope_scale = resolve_primary_eval_spec(args)
+    log0(
+        f"eval_primary: seq_len:{primary_eval_seq_len} rope_scale:{primary_eval_rope_scale:.4f} "
+        f"stride_frac:{args.eval_stride_frac:.4f} final_eval_mode:{args.final_eval_mode}"
+    )
+    if len(sweep_specs) > 1:
+        sweep_specs_log = ",".join(
+            f"{name}:{seq_len}@{rope_scale:.4f}"
+            for name, seq_len, rope_scale in sweep_specs[1:]
+        )
+        log0(f"eval_sweep: specs:{sweep_specs_log}")
+    if blend_specs:
+        blend_stride_frac = args.eval_blend_stride_frac if args.eval_blend_stride_frac > 0.0 else args.eval_stride_frac
+        blend_specs_log = ",".join(
+            f"{name}:{seq_len}@{rope_scale:.4f}"
+            for name, seq_len, rope_scale in blend_specs
+        )
+        blend_weights_log = ",".join(f"{weight:.6f}" for weight in blend_weights)
+        log0(
+            f"eval_blend: stride_frac:{blend_stride_frac:.4f} specs:{blend_specs_log} "
+            f"weights:{blend_weights_log}"
+        )
+    log0(
+        f"train_loss_mask: enabled:{int(args.train_loss_mask_enabled)} "
+        f"stride_frac:{train_loss_mask_stride_frac:.4f}"
     )
 
     # -----------------------------
@@ -2256,6 +2708,17 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
+    train_loss_mask_cache: dict[int, Tensor] = {}
+
+    def build_train_loss_mask(batch_size: int, seq_len: int) -> Tensor | None:
+        if not args.train_loss_mask_enabled:
+            return None
+        mask_cpu = train_loss_mask_cache.get(seq_len)
+        if mask_cpu is None:
+            mask_cpu, _, _ = build_loss_mask_cpu(seq_len, train_loss_mask_stride_frac)
+            train_loss_mask_cache[seq_len] = mask_cpu
+        return mask_cpu.unsqueeze(0).expand(batch_size, -1).to(device=device)
+
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
@@ -2281,11 +2744,12 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                warmup_loss_mask = build_train_loss_mask(x.size(0), args.train_seq_len)
                 if autocast_enabled:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                        warmup_loss = model(x, y)
+                        warmup_loss = model(x, y, loss_mask=warmup_loss_mask)
                 else:
-                    warmup_loss = model(x, y)
+                    warmup_loss = model(x, y, loss_mask=warmup_loss_mask)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -2447,6 +2911,7 @@ def main() -> None:
             teacher_logits: Tensor | None = None
             token_weights: Tensor | None = None
             aux_targets: Tensor | None = None
+            train_loss_mask = build_train_loss_mask(x.size(0), curr_seq_len)
             if distill_active and ema_teacher is not None:
                 # Use no_grad (not inference_mode) because inference tensors can error when
                 # downstream ops save them for backward (e.g., KL in distillation under compile).
@@ -2480,6 +2945,7 @@ def main() -> None:
                     loss = model(
                         x,
                         y,
+                        loss_mask=train_loss_mask,
                         per_token_weights=token_weights,
                         aux_targets=aux_targets,
                         aux_weight=dual_head_active_weight,
@@ -2492,6 +2958,7 @@ def main() -> None:
                 loss = model(
                     x,
                     y,
+                    loss_mask=train_loss_mask,
                     per_token_weights=token_weights,
                     aux_targets=aux_targets,
                     aux_weight=dual_head_active_weight,
@@ -2678,8 +3145,10 @@ def main() -> None:
         if device.type == "cuda":
             torch.cuda.synchronize()
         t_qeval = time.perf_counter()
-        q_val_loss, q_val_bpb = eval_val(
+        roundtrip_tag = f"final_{args.quant_scheme}_{resolved_compressor}_roundtrip"
+        q_val_loss, q_val_bpb = run_final_eval_suite(
             args,
+            roundtrip_tag,
             model,
             rank,
             world_size,
@@ -2690,15 +3159,21 @@ def main() -> None:
             base_bytes_lut,
             has_leading_space_lut,
             is_boundary_token_lut,
+            sweep_specs,
+            blend_specs,
+            blend_weights,
+            log0,
         )
         if device.type == "cuda":
             torch.cuda.synchronize()
-        roundtrip_tag = f"final_{args.quant_scheme}_{resolved_compressor}_roundtrip"
         log0(
             f"{roundtrip_tag} val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+            f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms mode:{args.final_eval_mode}"
         )
-        log0(f"{roundtrip_tag}_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        log0(
+            f"{roundtrip_tag}_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f} "
+            f"mode:{args.final_eval_mode}"
+        )
     else:
         log0("final_roundtrip skipped FINAL_ROUNDTRIP_EVAL=0")
 

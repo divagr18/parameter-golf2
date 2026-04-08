@@ -195,11 +195,31 @@ export GRAD_CLIP_NORM="${GRAD_CLIP_NORM:-1.0}"
 #    EVAL_STRIDE_FRAC=0.5 → stride=512, prefix=512 context guaranteed per token.
 #    EVAL_STRIDE_FRAC=1.0 (default) = original non-overlapping behavior.
 export EVAL_STRIDE_FRAC="${EVAL_STRIDE_FRAC:-0.5}"
+# Optional train-side loss mask aligned to sliding-window eval.
+# TRAIN_LOSS_MASK_ENABLED=1 keeps the context-only prefix but does not score it.
+# TRAIN_LOSS_MASK_STRIDE_FRAC=0 inherits EVAL_STRIDE_FRAC.
+export TRAIN_LOSS_MASK_ENABLED="${TRAIN_LOSS_MASK_ENABLED:-0}"
+export TRAIN_LOSS_MASK_STRIDE_FRAC="${TRAIN_LOSS_MASK_STRIDE_FRAC:-0.0}"
 
 # 2. Long-context eval: evaluate at longer sequence than training.
 #    0 = same as TRAIN_SEQ_LEN.  E.g. EVAL_SEQ_LEN=2048 with EVAL_ROPE_SCALE=4.
 export EVAL_SEQ_LEN="${EVAL_SEQ_LEN:-0}"
 export EVAL_ROPE_SCALE="${EVAL_ROPE_SCALE:-1.0}"
+# Optional extra end-of-run context sweep.
+export EVAL_SWEEP_SEQ_LENS="${EVAL_SWEEP_SEQ_LENS:-}"
+export EVAL_SWEEP_ROPE_SCALES="${EVAL_SWEEP_ROPE_SCALES:-}"
+
+# Optional multi-context eval blend. Include every context you want blended.
+# Example:
+#   EVAL_BLEND_SEQ_LENS=1024,2048
+#   EVAL_BLEND_WEIGHTS=0.4,0.6
+#   FINAL_EVAL_MODE=blend
+export EVAL_BLEND_SEQ_LENS="${EVAL_BLEND_SEQ_LENS:-}"
+export EVAL_BLEND_ROPE_SCALES="${EVAL_BLEND_ROPE_SCALES:-}"
+export EVAL_BLEND_WEIGHTS="${EVAL_BLEND_WEIGHTS:-}"
+# 0 inherits EVAL_STRIDE_FRAC.
+export EVAL_BLEND_STRIDE_FRAC="${EVAL_BLEND_STRIDE_FRAC:-0.0}"
+export FINAL_EVAL_MODE="${FINAL_EVAL_MODE:-primary}"
 
 # 3. Low-rank bigram logit bias: learnable factored n-gram prior on top of neural model.
 #    BIGRAM_RANK=32 adds ~64K int8 params (≈32KB), well within the 164KB budget headroom.
@@ -266,8 +286,12 @@ echo "logit_reg_w:    ${LOGIT_REG_WEIGHT}"
 echo "byte_loss:      ${BYTE_WEIGHTED_LOSS_ENABLED} (alpha=${BYTE_WEIGHTED_LOSS_ALPHA})"
 echo "dual_head:      ${DUAL_HEAD_ENABLED} (weight=${DUAL_HEAD_WEIGHT} start_frac=${DUAL_HEAD_START_FRAC} lr=${DUAL_HEAD_LR})"
 echo "eval_stride:    ${EVAL_STRIDE_FRAC}  (sliding window eval)"
+echo "train_mask:     ${TRAIN_LOSS_MASK_ENABLED} (stride_frac=${TRAIN_LOSS_MASK_STRIDE_FRAC})"
 echo "eval_seq_len:   ${EVAL_SEQ_LEN}  (0=train_seq_len)"
 echo "eval_rope_scale:${EVAL_ROPE_SCALE}"
+echo "eval_sweep:     ${EVAL_SWEEP_SEQ_LENS} (rope_scales=${EVAL_SWEEP_ROPE_SCALES})"
+echo "eval_blend:     ${EVAL_BLEND_SEQ_LENS} (rope_scales=${EVAL_BLEND_ROPE_SCALES} weights=${EVAL_BLEND_WEIGHTS} stride_frac=${EVAL_BLEND_STRIDE_FRAC})"
+echo "final_eval_mode:${FINAL_EVAL_MODE}"
 echo "bigram_rank:    ${BIGRAM_RANK}  (0=disabled)"
 echo "residual_ngram: ${RESIDUAL_NGRAM_ENABLED} (bigram_rank=${RESIDUAL_BIGRAM_RANK} trigram_rank=${RESIDUAL_TRIGRAM_RANK} lr=${RESIDUAL_NGRAM_LR} mix_init=${RESIDUAL_NGRAM_MIX_INIT})"
 echo "copy_cache:     ${COPY_CACHE_ENABLED} (window=${COPY_CACHE_WINDOW} dim=${COPY_CACHE_DIM} lr=${COPY_CACHE_LR} gate_init=${COPY_CACHE_GATE_INIT})"
@@ -284,7 +308,7 @@ set -e
 if [[ -f "${log_path}" ]]; then
   echo
   echo "=== Final Score + Budget ==="
-  grep -E '^final_.*_roundtrip_exact .*val_bpb:|^submission_budget .*total:.*budget:' "${log_path}" | tail -n 4 || true
+  grep -E '^final_.*val_bpb:|^submission_budget .*total:.*budget:' "${log_path}" | tail -n 12 || true
   echo
   echo "=== Step Stats ==="
   grep -E '^stopping_early:|^step:[0-9]+/[0-9]+ val_loss:' "${log_path}" | tail -n 5 || true
