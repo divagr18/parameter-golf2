@@ -84,6 +84,19 @@ class Hyperparameters:
     eval_blend_weights = os.environ.get("EVAL_BLEND_WEIGHTS", "").strip()
     # 0 = inherit EVAL_STRIDE_FRAC. Otherwise, use this stride fraction for the common scored span.
     eval_blend_stride_frac = float(os.environ.get("EVAL_BLEND_STRIDE_FRAC", "0.0"))
+    # Optional position-dependent blend ramp. Positive bias shifts weight from shorter contexts
+    # early in the scored span toward longer contexts later in the scored span.
+    eval_blend_position_bias = float(os.environ.get("EVAL_BLEND_POSITION_BIAS", "0.0"))
+    eval_blend_position_power = float(os.environ.get("EVAL_BLEND_POSITION_POWER", "1.0"))
+    # Eval-only continuous cache: mixes the base LM with a retrieval distribution over recent
+    # validation-history hidden states. This is eval-only and does not change the artifact.
+    eval_cont_cache_enabled = bool(int(os.environ.get("EVAL_CONT_CACHE_ENABLED", "0")))
+    eval_cont_cache_window = int(os.environ.get("EVAL_CONT_CACHE_WINDOW", "8192"))
+    eval_cont_cache_topk = int(os.environ.get("EVAL_CONT_CACHE_TOPK", "64"))
+    eval_cont_cache_weight = float(os.environ.get("EVAL_CONT_CACHE_WEIGHT", "0.12"))
+    eval_cont_cache_logit_scale = float(os.environ.get("EVAL_CONT_CACHE_LOGIT_SCALE", "12.0"))
+    eval_cont_cache_conf_power = float(os.environ.get("EVAL_CONT_CACHE_CONF_POWER", "1.0"))
+    eval_cont_cache_batch_seqs = int(os.environ.get("EVAL_CONT_CACHE_BATCH_SEQS", "8"))
     # primary | blend
     final_eval_mode = os.environ.get("FINAL_EVAL_MODE", "primary").strip().lower()
     # Low-rank bigram logit bias: learnable rank-r factored bigram table.
@@ -132,6 +145,10 @@ class Hyperparameters:
     # On-the-fly distillation (EMA teacher) in the late training tail.
     distill_enabled = bool(int(os.environ.get("DISTILL_ENABLED", "0")))
     distill_start_frac = float(os.environ.get("DISTILL_START_FRAC", "0.7"))
+    # Optional overrides for wallclock-capped runs. DISTILL_START_STEP wins over frac.
+    # DISTILL_START_WALLCLOCK_FRAC keys distillation off elapsed/max_wallclock instead of ITERATIONS.
+    distill_start_step = int(os.environ.get("DISTILL_START_STEP", "-1"))
+    distill_start_wallclock_frac = float(os.environ.get("DISTILL_START_WALLCLOCK_FRAC", "-1.0"))
     distill_weight = float(os.environ.get("DISTILL_WEIGHT", "0.1"))
     distill_temp = float(os.environ.get("DISTILL_TEMP", "1.5"))
     distill_ema_decay = float(os.environ.get("DISTILL_EMA_DECAY", "0.999"))
@@ -487,8 +504,115 @@ def resolve_train_loss_mask_stride_frac(args: Hyperparameters) -> float:
     return args.train_loss_mask_stride_frac if args.train_loss_mask_stride_frac > 0.0 else args.eval_stride_frac
 
 
+def resolve_distill_start_step(args: Hyperparameters) -> int:
+    if args.distill_start_step >= 0:
+        return args.distill_start_step
+    return int(max(0.0, min(1.0, args.distill_start_frac)) * args.iterations)
+
+
+def distill_is_active(
+    args: Hyperparameters,
+    step: int,
+    elapsed_ms: float,
+    max_wallclock_ms: float | None,
+    distill_start_step: int,
+) -> bool:
+    if args.distill_start_step >= 0:
+        return step >= args.distill_start_step
+    if args.distill_start_wallclock_frac >= 0.0 and max_wallclock_ms is not None:
+        start_frac = max(0.0, min(1.0, args.distill_start_wallclock_frac))
+        return elapsed_ms >= start_frac * max_wallclock_ms
+    return step >= distill_start_step
+
+
+def build_blend_position_log_weights(
+    args: Hyperparameters,
+    blend_specs: list[tuple[str, int, float]],
+    blend_weights: list[float],
+    blend_stride: int,
+    device: torch.device,
+) -> Tensor:
+    base_log_weights = torch.log(torch.tensor(blend_weights, device=device, dtype=torch.float32).clamp_min(1e-12))
+    if args.eval_blend_position_bias == 0.0 or len(blend_specs) <= 1:
+        return base_log_weights[:, None].expand(-1, blend_stride)
+
+    seq_lens = torch.tensor([seq_len for _, seq_len, _ in blend_specs], device=device, dtype=torch.float32)
+    centered = seq_lens - seq_lens.mean()
+    centered = centered / centered.abs().max().clamp_min(1e-6)
+    pos = torch.linspace(0.0, 1.0, steps=blend_stride, device=device, dtype=torch.float32)
+    signed_pos = 2.0 * pos - 1.0
+    power = max(float(args.eval_blend_position_power), 1e-6)
+    if power != 1.0:
+        signed_pos = signed_pos.sign() * signed_pos.abs().pow(power)
+    logits = base_log_weights[:, None] + float(args.eval_blend_position_bias) * centered[:, None] * signed_pos[None, :]
+    return F.log_softmax(logits, dim=0)
+
+
+def apply_eval_continuous_cache(
+    args: Hyperparameters,
+    scored_log_probs: Tensor,
+    scored_hidden: Tensor,
+    scored_targets: Tensor,
+    cache_state: tuple[Tensor, Tensor] | None,
+) -> tuple[Tensor, tuple[Tensor, Tensor] | None]:
+    if not args.eval_cont_cache_enabled:
+        return scored_log_probs, cache_state
+
+    flat_log_probs = scored_log_probs.reshape(-1, scored_log_probs.size(-1)).float()
+    flat_hidden = F.normalize(scored_hidden.reshape(-1, scored_hidden.size(-1)).float(), dim=-1)
+    flat_targets = scored_targets.reshape(-1).to(dtype=torch.int64)
+    mixed_log_probs = flat_log_probs
+
+    if cache_state is not None and cache_state[0].numel() > 0:
+        cache_keys, cache_values = cache_state
+        scores = torch.matmul(flat_hidden, cache_keys.transpose(0, 1)) * float(args.eval_cont_cache_logit_scale)
+        topk = min(max(int(args.eval_cont_cache_topk), 0), cache_keys.size(0))
+        if topk > 0 and topk < cache_keys.size(0):
+            scores, top_idx = torch.topk(scores, k=topk, dim=-1)
+            retrieved_ids = cache_values[top_idx]
+        else:
+            retrieved_ids = cache_values.unsqueeze(0).expand(scores.size(0), -1)
+        attn = F.softmax(scores, dim=-1)
+        cache_probs = torch.zeros_like(mixed_log_probs)
+        cache_probs.scatter_add_(1, retrieved_ids, attn)
+        cache_log_probs = torch.log(cache_probs.clamp_min(1e-9))
+        mix = torch.full(
+            (mixed_log_probs.size(0),),
+            float(args.eval_cont_cache_weight),
+            device=mixed_log_probs.device,
+            dtype=torch.float32,
+        )
+        if args.eval_cont_cache_conf_power >= 0.0:
+            cache_conf = cache_probs.max(dim=-1).values.clamp_(0.0, 1.0)
+            mix = mix * cache_conf.pow(float(args.eval_cont_cache_conf_power))
+        mix = mix.clamp(min=1e-5, max=1.0 - 1e-5)
+        mixed_log_probs = torch.logaddexp(
+            torch.log1p(-mix).unsqueeze(-1) + mixed_log_probs,
+            torch.log(mix).unsqueeze(-1) + cache_log_probs,
+        )
+
+    window = max(1, int(args.eval_cont_cache_window))
+    new_keys = flat_hidden.detach()[-window:]
+    new_values = flat_targets.detach()[-window:]
+    if cache_state is None or cache_state[0].numel() == 0:
+        updated_state = (new_keys, new_values)
+    else:
+        cache_keys, cache_values = cache_state
+        cache_keys = torch.cat((cache_keys, new_keys), dim=0)
+        cache_values = torch.cat((cache_values, new_values), dim=0)
+        if cache_keys.size(0) > window:
+            cache_keys = cache_keys[-window:]
+            cache_values = cache_values[-window:]
+        updated_state = (cache_keys.detach(), cache_values.detach())
+    return mixed_log_probs.reshape_as(scored_log_probs).to(dtype=scored_log_probs.dtype), updated_state
+
+
 def get_eval_model(model: nn.Module) -> nn.Module:
     raw_model = model.module if hasattr(model, "module") else model
+    if hasattr(raw_model, "forward_hidden_and_output"):
+        return raw_model
+    if hasattr(raw_model, "_orig_mod") and hasattr(raw_model._orig_mod, "forward_hidden_and_output"):
+        return raw_model._orig_mod
     if hasattr(raw_model, "forward_logits"):
         return raw_model
     if hasattr(raw_model, "_orig_mod") and hasattr(raw_model._orig_mod, "forward_logits"):
@@ -507,6 +631,8 @@ def apply_eval_rope_scaling(
     head_dim = args.model_dim // args.num_heads
     ntk_factor = rope_scale ** (head_dim / max(head_dim - 2, 1))
     raw_model = get_eval_model(model)
+    if not hasattr(raw_model, "blocks"):
+        return []
     orig_rope_bases: list[tuple[object, Tensor]] = []
     for block in raw_model.blocks:
         attn = getattr(block, "attn", None)
@@ -529,28 +655,28 @@ def restore_eval_rope_scaling(orig_rope_bases: list[tuple[object, Tensor]]) -> N
         rot._cos_cached = None
 
 
-def forward_eval_log_probs(
+def forward_eval_outputs(
     args: Hyperparameters,
     model: nn.Module,
     x: Tensor,
     seq_len: int,
     rope_scale: float,
     autocast_enabled: bool,
-) -> Tensor:
+) -> tuple[Tensor, Tensor]:
     eval_model = get_eval_model(model)
     orig_rope_bases = apply_eval_rope_scaling(model, args, seq_len, rope_scale)
     try:
         if autocast_enabled:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                logits = eval_model.forward_logits(x)
+                hidden, logits, logits_are_log_probs = eval_model.forward_hidden_and_output(x)
         else:
-            logits = eval_model.forward_logits(x)
+            hidden, logits, logits_are_log_probs = eval_model.forward_hidden_and_output(x)
     finally:
         restore_eval_rope_scaling(orig_rope_bases)
     log_probs = logits.float().reshape(x.size(0), x.size(1), -1)
-    if not bool(getattr(eval_model, "copy_cache_enabled", False)):
+    if not logits_are_log_probs:
         log_probs = F.log_softmax(log_probs, dim=-1)
-    return log_probs
+    return log_probs, hidden.float()
 
 
 def eval_val_single(
@@ -570,9 +696,13 @@ def eval_val_single(
     stride_frac: float,
 ) -> tuple[float, float]:
     _, prefix_len, stride = build_loss_mask_cpu(seq_len, stride_frac)
+    if args.eval_cont_cache_enabled and world_size != 1:
+        raise ValueError("EVAL_CONT_CACHE_ENABLED currently requires WORLD_SIZE=1 for deterministic eval order")
 
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     local_batch_seqs = max(1, local_batch_tokens // seq_len)
+    if args.eval_cont_cache_enabled:
+        local_batch_seqs = min(local_batch_seqs, max(1, args.eval_cont_cache_batch_seqs))
     total_wins = max(1, (val_tokens.numel() - seq_len - 1) // stride)
     win_start = (total_wins * rank) // world_size
     win_end = (total_wins * (rank + 1)) // world_size
@@ -582,6 +712,7 @@ def eval_val_single(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
+    cache_state: tuple[Tensor, Tensor] | None = None
     with torch.inference_mode():
         for batch_win_start in range(win_start, win_end, local_batch_seqs):
             batch_win_end = min(batch_win_start + local_batch_seqs, win_end)
@@ -592,9 +723,17 @@ def eval_val_single(
                 ys.append(val_tokens[s + 1 : s + seq_len + 1])
             x = torch.stack(xs).to(device=device, dtype=torch.int64, non_blocking=True)
             y = torch.stack(ys).to(device=device, dtype=torch.int64, non_blocking=True)
-            log_probs = forward_eval_log_probs(args, model, x, seq_len, rope_scale, autocast_enabled)
+            log_probs, hidden = forward_eval_outputs(args, model, x, seq_len, rope_scale, autocast_enabled)
             scored_log_probs = log_probs[:, prefix_len:, :]
+            scored_hidden = hidden[:, prefix_len:, :]
             scored_targets = y[:, prefix_len:]
+            scored_log_probs, cache_state = apply_eval_continuous_cache(
+                args,
+                scored_log_probs,
+                scored_hidden,
+                scored_targets,
+                cache_state,
+            )
             target_log_probs = scored_log_probs.gather(-1, scored_targets.unsqueeze(-1)).squeeze(-1)
             val_loss_sum += (-target_log_probs).sum(dtype=torch.float64)
             val_token_count += target_log_probs.numel()
@@ -634,6 +773,8 @@ def eval_val_blend(
 ) -> tuple[float, float]:
     if not blend_specs:
         raise ValueError("eval_val_blend requires at least one blend spec")
+    if args.eval_cont_cache_enabled and world_size != 1:
+        raise ValueError("EVAL_CONT_CACHE_ENABLED currently requires WORLD_SIZE=1 for deterministic eval order")
 
     blend_stride_frac = args.eval_blend_stride_frac if args.eval_blend_stride_frac > 0.0 else args.eval_stride_frac
     min_seq_len = min(seq_len for _, seq_len, _ in blend_specs)
@@ -650,6 +791,8 @@ def eval_val_blend(
 
     local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
     local_batch_chunks = max(1, local_batch_tokens // max(max_seq_len * len(blend_specs), 1))
+    if args.eval_cont_cache_enabled:
+        local_batch_chunks = min(local_batch_chunks, max(1, args.eval_cont_cache_batch_seqs))
     total_chunks = ((max_target_start - first_target_pos) // blend_stride) + 1
     chunk_start = (total_chunks * rank) // world_size
     chunk_end = (total_chunks * (rank + 1)) // world_size
@@ -657,14 +800,19 @@ def eval_val_blend(
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-
-    log_weights = [math.log(max(weight, 1e-12)) for weight in blend_weights]
-
     model.eval()
+    cache_states: list[tuple[Tensor, Tensor] | None] = [None] * len(blend_specs)
     with torch.inference_mode():
         for batch_chunk_start in range(chunk_start, chunk_end, local_batch_chunks):
             batch_chunk_end = min(batch_chunk_start + local_batch_chunks, chunk_end)
             target_starts = [first_target_pos + idx * blend_stride for idx in range(batch_chunk_start, batch_chunk_end)]
+            pos_log_weights = build_blend_position_log_weights(
+                args,
+                blend_specs,
+                blend_weights,
+                blend_stride,
+                device,
+            )
 
             common_prev_ids = torch.stack(
                 [val_tokens[target_pos - 1 : target_pos + blend_stride - 1] for target_pos in target_starts]
@@ -674,7 +822,7 @@ def eval_val_blend(
             ).to(device=device, dtype=torch.int64, non_blocking=True)
 
             blend_log_probs: Tensor | None = None
-            for (spec_name, seq_len, rope_scale), log_weight in zip(blend_specs, log_weights, strict=True):
+            for spec_idx, (spec_name, seq_len, rope_scale) in enumerate(blend_specs):
                 del spec_name
                 prefix_len = seq_len - blend_stride
                 xs = []
@@ -682,9 +830,17 @@ def eval_val_blend(
                     s = target_pos - prefix_len - 1
                     xs.append(val_tokens[s : s + seq_len])
                 x = torch.stack(xs).to(device=device, dtype=torch.int64, non_blocking=True)
-                log_probs = forward_eval_log_probs(args, model, x, seq_len, rope_scale, autocast_enabled)
+                log_probs, hidden = forward_eval_outputs(args, model, x, seq_len, rope_scale, autocast_enabled)
                 scored_log_probs = log_probs[:, prefix_len:, :]
-                weighted_log_probs = scored_log_probs + log_weight
+                scored_hidden = hidden[:, prefix_len:, :]
+                scored_log_probs, cache_states[spec_idx] = apply_eval_continuous_cache(
+                    args,
+                    scored_log_probs,
+                    scored_hidden,
+                    common_target_ids,
+                    cache_states[spec_idx],
+                )
+                weighted_log_probs = scored_log_probs + pos_log_weights[spec_idx][None, :, None]
                 blend_log_probs = (
                     weighted_log_probs
                     if blend_log_probs is None
@@ -836,7 +992,9 @@ def run_final_eval_suite(
         blend_weights_log = ",".join(f"{weight:.6f}" for weight in blend_weights)
         log0(
             f"{roundtrip_tag}_blend_exact stride_frac:{blend_stride_frac:.4f} specs:{blend_specs_log} "
-            f"weights:{blend_weights_log} val_loss:{blend_val_loss:.8f} val_bpb:{blend_val_bpb:.8f}"
+            f"weights:{blend_weights_log} position_bias:{args.eval_blend_position_bias:.4f} "
+            f"position_power:{args.eval_blend_position_power:.4f} "
+            f"val_loss:{blend_val_loss:.8f} val_bpb:{blend_val_bpb:.8f}"
         )
         blend_result = (blend_val_loss, blend_val_bpb)
 
@@ -2047,7 +2205,7 @@ class GPT(nn.Module):
         )
         return mixed_log_probs.reshape(-1, mixed_log_probs.size(-1)).to(dtype=composed.dtype), True
 
-    def forward_logits(self, input_ids: Tensor) -> Tensor:
+    def _forward_hidden(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -2065,8 +2223,11 @@ class GPT(nn.Module):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 x, _ = self.blocks[self.num_encoder_layers + i](x, x0)
+        return self.final_norm(x)
 
-        flat_h = self.final_norm(x).reshape(-1, x.size(-1))
+    def forward_hidden_and_output(self, input_ids: Tensor) -> tuple[Tensor, Tensor, bool]:
+        h = self._forward_hidden(input_ids)
+        flat_h = h.reshape(-1, h.size(-1))
         if self.tie_embeddings:
             logits_proj = F.linear(flat_h, self.tok_emb.weight)
         else:
@@ -2076,8 +2237,11 @@ class GPT(nn.Module):
         if self.bigram_rank > 0:
             bg = self.bigram_right(self.bigram_left(input_ids.reshape(-1)))  # [B*T, vocab]
             logits_proj = logits_proj + self.bigram_scale * bg
-        h = self.final_norm(x)
-        logits, _ = self._compose_output_logits(logits_proj, input_ids, h)
+        logits, logits_are_log_probs = self._compose_output_logits(logits_proj, input_ids, h)
+        return h, logits, logits_are_log_probs
+
+    def forward_logits(self, input_ids: Tensor) -> Tensor:
+        _, logits, _ = self.forward_hidden_and_output(input_ids)
         return logits
 
     def forward(
@@ -2421,8 +2585,15 @@ def main() -> None:
         blend_weights_log = ",".join(f"{weight:.6f}" for weight in blend_weights)
         log0(
             f"eval_blend: stride_frac:{blend_stride_frac:.4f} specs:{blend_specs_log} "
-            f"weights:{blend_weights_log}"
+            f"weights:{blend_weights_log} position_bias:{args.eval_blend_position_bias:.4f} "
+            f"position_power:{args.eval_blend_position_power:.4f}"
         )
+    log0(
+        f"eval_cont_cache: enabled:{int(args.eval_cont_cache_enabled)} "
+        f"window:{args.eval_cont_cache_window} topk:{args.eval_cont_cache_topk} "
+        f"weight:{args.eval_cont_cache_weight:.4f} logit_scale:{args.eval_cont_cache_logit_scale:.4f} "
+        f"conf_power:{args.eval_cont_cache_conf_power:.4f} batch_seqs:{args.eval_cont_cache_batch_seqs}"
+    )
     log0(
         f"train_loss_mask: enabled:{int(args.train_loss_mask_enabled)} "
         f"stride_frac:{train_loss_mask_stride_frac:.4f}"
@@ -2654,6 +2825,7 @@ def main() -> None:
         f"mtp_enabled:{args.mtp_enabled} mtp_steps:{args.mtp_steps} mtp_weight:{args.mtp_weight} "
         f"mtp_decay:{args.mtp_decay} mtp_tie_embeddings:{args.mtp_tie_embeddings} "
         f"distill_enabled:{args.distill_enabled} distill_start_frac:{args.distill_start_frac} "
+        f"distill_start_step:{args.distill_start_step} distill_start_wallclock_frac:{args.distill_start_wallclock_frac} "
         f"distill_weight:{args.distill_weight} distill_temp:{args.distill_temp} distill_ema_decay:{args.distill_ema_decay} "
         f"logit_reg_weight:{args.logit_reg_weight} byte_weighted_loss:{args.byte_weighted_loss_enabled} "
         f"byte_weighted_loss_alpha:{args.byte_weighted_loss_alpha} "
@@ -2764,7 +2936,7 @@ def main() -> None:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    distill_start_step = int(max(0.0, min(1.0, args.distill_start_frac)) * args.iterations)
+    distill_start_step = resolve_distill_start_step(args)
     dual_head_start_step = int(max(0.0, min(1.0, args.dual_head_start_frac)) * args.iterations)
     ema_teacher: GPT | None = None
     if args.distill_enabled and args.distill_weight > 0.0:
@@ -2772,6 +2944,17 @@ def main() -> None:
         ema_teacher.eval()
         for p in ema_teacher.parameters():
             p.requires_grad_(False)
+    if args.distill_enabled and args.distill_weight > 0.0:
+        distill_mode = (
+            f"step:{args.distill_start_step}"
+            if args.distill_start_step >= 0
+            else (
+                f"wallclock_frac:{max(0.0, min(1.0, args.distill_start_wallclock_frac)):.4f}"
+                if args.distill_start_wallclock_frac >= 0.0 and max_wallclock_ms is not None
+                else f"iter_frac:{max(0.0, min(1.0, args.distill_start_frac)):.4f}"
+            )
+        )
+        log0(f"distill_start: mode:{distill_mode} resolved_step:{distill_start_step}")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -2893,8 +3076,8 @@ def main() -> None:
 
         distill_active = (
             ema_teacher is not None
-            and step >= distill_start_step
             and args.distill_weight > 0.0
+            and distill_is_active(args, step, elapsed_ms, max_wallclock_ms, distill_start_step)
         )
         dual_head_active_weight = (
             float(args.dual_head_weight)
