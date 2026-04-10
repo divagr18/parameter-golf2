@@ -157,6 +157,15 @@ export QAT_START_STEP="${QAT_START_STEP:-9000}"
 # vs ~0.054 for baseline progressive QAT.
 export QAT_LSQ="${QAT_LSQ:-0}"
 
+# GPTQ post-training quantization (Hessian-aware, replaces naive round-to-nearest).
+# When GPTQ=1, calibration data is run through the model after training to collect
+# Hessian statistics, then weights are quantized column-by-column with error
+# compensation. Typically gives 0.01-0.015 BPB improvement over naive quantization.
+export GPTQ="${GPTQ:-0}"
+export GPTQ_NSAMPLES="${GPTQ_NSAMPLES:-128}"
+export GPTQ_BLOCKSIZE="${GPTQ_BLOCKSIZE:-128}"
+export GPTQ_PERCDAMP="${GPTQ_PERCDAMP:-0.01}"
+
 # Optional hybrid SSM blocks: replace every Nth attention block with an SSM-style mixer.
 export USE_SSM="${USE_SSM:-0}"
 export SSM_EVERY_N="${SSM_EVERY_N:-2}"
@@ -262,7 +271,10 @@ export CURRICULUM_STEPS="${CURRICULUM_STEPS:-5000}"
 export DISTILL_START_STEP="${DISTILL_START_STEP:--1}"
 export DISTILL_START_WALLCLOCK_FRAC="${DISTILL_START_WALLCLOCK_FRAC:--1.0}"
 
-# Best Muon profile from phase3 sweep
+# Attention QK-Gain init (leaderboard uses 5.0-5.25 for sharper attention)
+export QK_GAIN_INIT="${QK_GAIN_INIT:-1.5}"
+
+# Best Muon profile from phase3 sweep (now with MuonEq-R row equilibration)
 export MUON_MOMENTUM="${MUON_MOMENTUM:-0.98}"
 export MUON_BACKEND_STEPS="${MUON_BACKEND_STEPS:-5}"
 export MUON_MOMENTUM_WARMUP_START="${MUON_MOMENTUM_WARMUP_START:-0.85}"
@@ -290,6 +302,8 @@ echo "recurrence:     core=${RECURRENT_CORE_LAYERS} steps=${RECURRENT_STEPS}  [F
 echo "use_swiglu:     ${USE_SWIGLU}"
 echo "moe:            experts=${MOE_NUM_EXPERTS} every_n=${MOE_EVERY_N} cap=${MOE_CAPACITY_FACTOR} aux=${MOE_AUX_LOSS_COEFF}"
 echo "qat:            scheme=${QAT_SCHEME} start_step=${QAT_START_STEP} lsq=${QAT_LSQ}"
+echo "gptq:           ${GPTQ} (nsamples=${GPTQ_NSAMPLES} blocksize=${GPTQ_BLOCKSIZE} percdamp=${GPTQ_PERCDAMP})"
+echo "qk_gain_init:   ${QK_GAIN_INIT}"
 echo "use_ssm:        ${USE_SSM} (every_n=${SSM_EVERY_N} expand=${SSM_EXPAND} kernel=${SSM_KERNEL})"
 echo "use_mtp:        ${MTP_ENABLED} (steps=${MTP_STEPS} weight=${MTP_WEIGHT} decay=${MTP_DECAY} tie=${MTP_TIE_EMBEDDINGS} lr=${MTP_LR})"
 echo "distill:        ${DISTILL_ENABLED} (start_frac=${DISTILL_START_FRAC} start_step=${DISTILL_START_STEP} start_wallclock_frac=${DISTILL_START_WALLCLOCK_FRAC} weight=${DISTILL_WEIGHT} temp=${DISTILL_TEMP} ema=${DISTILL_EMA_DECAY})"

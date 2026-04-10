@@ -183,6 +183,12 @@ class Hyperparameters:
     # letting the model optimise the clip threshold per output row via backprop (STE).
     qat_lsq = bool(int(os.environ.get("QAT_LSQ", "0")))
 
+    # GPTQ post-training quantization (replaces naive round-to-nearest at export).
+    gptq_enabled = bool(int(os.environ.get("GPTQ", "0")))
+    gptq_nsamples = int(os.environ.get("GPTQ_NSAMPLES", "128"))
+    gptq_blocksize = int(os.environ.get("GPTQ_BLOCKSIZE", "128"))
+    gptq_percdamp = float(os.environ.get("GPTQ_PERCDAMP", "0.01"))
+
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
@@ -300,6 +306,10 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
+                    # MuonEq-R: row equilibration before Newton-Schulz
+                    # (removes marginal row-scale mismatch, arxiv 2603.28254)
+                    if g.ndim == 2:
+                        g = g / g.norm(dim=1, keepdim=True).clamp(min=1e-8)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
@@ -1173,6 +1183,7 @@ def quantize_state_dict(
     weight_order: str = "none",
     mixed_low_precision_scheme: str = "int8",
     precomputed_scales: dict[str, Tensor] | None = None,
+    gptq_results: dict[str, tuple[Tensor, Tensor]] | None = None,
 ):
     if scheme not in SUPPORTED_QUANT_SCHEMES:
         raise ValueError(f"Unsupported QUANT_SCHEME={scheme!r}; expected one of {sorted(SUPPORTED_QUANT_SCHEMES)}")
@@ -1243,6 +1254,24 @@ def quantize_state_dict(
             continue
 
         stats["num_float_tensors"] += 1
+
+        # GPTQ fast path: use pre-quantized (Q, scale) from Hessian-aware quantization
+        if gptq_results is not None and name in gptq_results and t.ndim == 2:
+            gq, gs = gptq_results[name]
+            if active_scheme == "int4":
+                packed = pack_int4_signed(gq)
+                meta = {"scheme": "int4_per_row", "axis": 0, "orig_shape": [int(t.shape[0]), int(t.shape[1])]}
+                quantized[name] = packed
+                scales[name] = gs.to(dtype=INT4_PER_ROW_SCALE_DTYPE).contiguous()
+            else:
+                meta = {"scheme": "int8_per_row", "axis": 0}
+                quantized[name] = gq.contiguous()
+                scales[name] = gs.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+            qmeta[name] = meta
+            dtypes[name] = str(t.dtype).removeprefix("torch.")
+            stats["payload_bytes"] += tensor_nbytes(quantized[name]) + tensor_nbytes(scales[name])
+            continue
+
         pre_scale = None
         if precomputed_scales is not None and t.ndim == 2:
             pre_scale = precomputed_scales.get(name)
@@ -1274,6 +1303,173 @@ def quantize_state_dict(
     # Backward-compatible alias for existing log paths.
     stats["int8_payload_bytes"] = stats["payload_bytes"]
     return obj, stats
+
+# ---- GPTQ: Accurate Post-Training Quantization (Frantar et al., 2022) ----
+
+@torch.no_grad()
+def gptq_quantize_weight(
+    W: Tensor,
+    H: Tensor,
+    bits: int = 4,
+    percdamp: float = 0.01,
+    blocksize: int = 128,
+) -> tuple[Tensor, Tensor]:
+    """GPTQ-quantize a single weight matrix using Hessian information.
+
+    Args:
+        W: [out_features, in_features] weight matrix
+        H: [in_features, in_features] Hessian proxy (X^T X / n)
+        bits: 4 or 8
+        percdamp: damping fraction of mean diagonal
+        blocksize: column block size for lazy batch updates
+
+    Returns:
+        (Q_int8, scale_per_row) where Q_int8 holds the quantized integers
+        and scale_per_row is the per-row step size for dequantization.
+    """
+    device = W.device
+    rows, cols = W.shape
+    W = W.clone().float()
+    H = H.clone().float().to(device)
+
+    if bits == 4:
+        maxq, minq, sym_max = 7, -8, 7.0
+    else:
+        maxq, minq, sym_max = 127, -127, 127.0
+
+    # Dead columns (no activation energy) → zero out weight and fix Hessian
+    dead = torch.diag(H) == 0
+    H[dead, dead] = 1.0
+    W[:, dead] = 0.0
+
+    # Damping for numerical stability
+    damp = percdamp * torch.mean(torch.diag(H)).item()
+    diag = torch.arange(cols, device=device)
+    H[diag, diag] += damp
+
+    # Compute H^{-1} via Cholesky for stability
+    try:
+        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+    except torch.linalg.LinAlgError:
+        H[diag, diag] += 10 * damp
+        Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
+
+    # Per-row scale: max-abs / sym_max
+    scale = W.abs().amax(dim=1).clamp(min=1e-8) / sym_max
+
+    Q = torch.zeros(rows, cols, dtype=torch.int8, device=device)
+
+    for i1 in range(0, cols, blocksize):
+        i2 = min(i1 + blocksize, cols)
+        Err1 = torch.zeros(rows, i2 - i1, device=device)
+
+        for j in range(i2 - i1):
+            col = i1 + j
+            w = W[:, col]
+            d = Hinv[col, col].clamp(min=1e-10)
+
+            q = torch.clamp(torch.round(w / scale), minq, maxq)
+            Q[:, col] = q.to(torch.int8)
+
+            err = (w - q * scale) / d
+            Err1[:, j] = err
+
+            W[:, col] = q * scale  # replace with dequantized
+            if j + 1 < i2 - i1:
+                W[:, col + 1 : i2] -= err.unsqueeze(1) * Hinv[col, col + 1 : i2].unsqueeze(0)
+
+        # Lazy batch update: propagate accumulated error to remaining columns
+        if i2 < cols:
+            W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
+
+    return Q, scale
+
+
+@torch.no_grad()
+def collect_gptq_hessians(
+    model: nn.Module,
+    val_tokens: Tensor,
+    device: torch.device,
+    seq_len: int = 1024,
+    nsamples: int = 128,
+) -> dict[str, Tensor]:
+    """Collect H = (1/n) X^T X for each CastedLinear by running calibration data."""
+    hessians: dict[str, Tensor] = {}
+    sample_counts: dict[str, int] = {}
+    hooks = []
+
+    for name, module in model.named_modules():
+        if isinstance(module, CastedLinear):
+            key = name + ".weight"
+            hessians[key] = torch.zeros(module.in_features, module.in_features, device=device)
+            sample_counts[key] = 0
+
+            def make_hook(k: str):
+                def hook_fn(mod, inp, out):
+                    x = inp[0].detach().float()
+                    if x.ndim == 3:
+                        x = x.reshape(-1, x.shape[-1])
+                    hessians[k].addmm_(x.T, x)
+                    sample_counts[k] += x.shape[0]
+                return hook_fn
+
+            hooks.append(module.register_forward_hook(make_hook(key)))
+
+    # Disable QAT fake-quant during calibration
+    saved_qat_levels = CastedLinear.qat_levels
+    CastedLinear.qat_levels = 0
+
+    model.eval()
+    total_tokens = val_tokens.numel() - 1
+    tokens_used = 0
+    with torch.inference_mode():
+        for i in range(0, total_tokens - seq_len, seq_len):
+            if tokens_used >= nsamples * seq_len:
+                break
+            x = val_tokens[i : i + seq_len].unsqueeze(0).to(device=device, dtype=torch.int64)
+            y = val_tokens[i + 1 : i + seq_len + 1].unsqueeze(0).to(device=device, dtype=torch.int64)
+            model(x, y)
+            tokens_used += seq_len
+
+    CastedLinear.qat_levels = saved_qat_levels
+
+    for h in hooks:
+        h.remove()
+
+    # Normalize: H = (1/n) * X^T X
+    for key in hessians:
+        n = max(sample_counts[key], 1)
+        hessians[key] /= n
+
+    return hessians
+
+
+@torch.no_grad()
+def gptq_quantize_state_dict(
+    model: nn.Module,
+    state_dict: dict[str, Tensor],
+    hessians: dict[str, Tensor],
+    bits: int = 4,
+    percdamp: float = 0.01,
+    blocksize: int = 128,
+) -> dict[str, tuple[Tensor, Tensor]]:
+    """Apply GPTQ to all CastedLinear weights that have Hessians.
+
+    Returns {state_dict_key: (Q_int8, scale_per_row)} for quantized 2D tensors.
+    Non-quantized tensors are not included.
+    """
+    device = next(model.parameters()).device
+    results: dict[str, tuple[Tensor, Tensor]] = {}
+    for name in sorted(hessians.keys()):
+        if name not in state_dict:
+            continue
+        W = state_dict[name].to(device)
+        if W.ndim != 2:
+            continue
+        H = hessians[name]
+        Q, scale = gptq_quantize_weight(W, H, bits=bits, percdamp=percdamp, blocksize=blocksize)
+        results[name] = (Q.cpu(), scale.cpu())
+    return results
 
 def dequantize_state_dict(obj: dict[str, object]) -> dict[str, Tensor]:
     out: dict[str, Tensor] = {}
@@ -2796,6 +2992,7 @@ def main() -> None:
     # Dedicated optimizer for LSQ per-row log_scale parameters across the WHOLE model.
     # These are 1D learnable steps inside every CastedLinear (blocks + lm_head + bigram + ...),
     # not all of which would otherwise land in scalar_params (which only walks blocks).
+    optimizer_lsq: torch.optim.Optimizer | None = None
     if args.qat_lsq:
         lsq_params: list[nn.Parameter] = [
             m.qat_log_scale
@@ -3065,6 +3262,11 @@ def main() -> None:
                 if args.qat_lsq and target_levels > 0 and prev_levels != target_levels:
                     n_lsq = init_lsq_scales(base_model, target_levels)
                     log0(f"qat: lsq_init count:{n_lsq} levels:{target_levels}")
+                    # Clear stale Adam momentum/variance from the previous level regime
+                    # so the fresh scale values get unbiased gradient updates.
+                    if optimizer_lsq is not None:
+                        optimizer_lsq.state.clear()
+                        log0(f"qat: lsq_state_reset levels:{target_levels}")
 
         # Sequence length curriculum: ramp from curriculum_min_seq_len → train_seq_len.
         if args.curriculum_enabled and step < args.curriculum_steps:
@@ -3228,27 +3430,50 @@ def main() -> None:
             )
 
     resolved_compressor, compressor_note = resolve_compressor(args.compressor)
-    # LSQ export plumbing: collect learned per-row scales and strip the log_scale
-    # parameters from the state_dict (not needed at inference; dequantised weights
-    # are used directly). The collected scales are passed to the quantiser so it
-    # uses the LSQ-optimised scale instead of the quantile-derived one.
+
     export_state_dict = base_model.state_dict()
+
+    # LSQ export plumbing (if enabled): collect learned per-row scales and strip
+    # the log_scale parameters from the state_dict.
     lsq_scales_export: dict[str, Tensor] | None = None
     if args.qat_lsq:
         lsq_scales_export = collect_lsq_scales(base_model)
-        # Drop every *.qat_log_scale entry from the state_dict so it doesn't
-        # bloat the passthrough payload.
         export_state_dict = {
             k: v for k, v in export_state_dict.items() if not k.endswith(".qat_log_scale")
         }
         if master_process:
             log0(f"qat_lsq: collected {len(lsq_scales_export)} per-row scales for export")
+
+    # GPTQ: Hessian-aware post-training quantization (replaces naive round-to-nearest).
+    gptq_results: dict[str, tuple[Tensor, Tensor]] | None = None
+    if args.gptq_enabled:
+        gptq_bits = 4 if args.quant_scheme in ("int4", "mixed") else 8
+        if master_process:
+            log0(f"gptq: collecting Hessians from {args.gptq_nsamples} calibration samples...")
+        CastedLinear.qat_levels = 0  # disable fake-quant for calibration
+        hessians = collect_gptq_hessians(
+            base_model, val_tokens, device,
+            seq_len=args.train_seq_len,
+            nsamples=args.gptq_nsamples,
+        )
+        if master_process:
+            log0(f"gptq: collected {len(hessians)} Hessians, quantizing with bits={gptq_bits}...")
+        gptq_results = gptq_quantize_state_dict(
+            base_model, export_state_dict, hessians,
+            bits=gptq_bits,
+            percdamp=args.gptq_percdamp,
+            blocksize=args.gptq_blocksize,
+        )
+        if master_process:
+            log0(f"gptq: quantized {len(gptq_results)} weight matrices")
+
     quant_obj, quant_stats = quantize_state_dict(
         export_state_dict,
         scheme=args.quant_scheme,
         weight_order=args.weight_order,
         mixed_low_precision_scheme=args.mixed_low_precision_scheme,
         precomputed_scales=lsq_scales_export,
+        gptq_results=gptq_results,
     )
     artifact_name = export_artifact_name(args.quant_scheme, resolved_compressor)
     quant_buf = io.BytesIO()
