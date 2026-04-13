@@ -2566,9 +2566,12 @@ class GPT(nn.Module):
             for i in range(self.num_encoder_layers):
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
                 for s in range(n_rep):
-                    if n_rep > 1 and self.intra_loop_pos_emb.numel() > 0:
-                        emb = self.intra_loop_pos_emb[i - self.intra_loop_start, s]
-                        x = x + emb.to(dtype=x.dtype)
+                    if n_rep > 1 and len(self.intra_loop_controllers) > 0:
+                        ctrl = self.intra_loop_controllers[i - self.intra_loop_start]
+                        out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                        scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
+                        shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
+                        x = x * (1.0 + scale.tanh()) + shift
                     x, zl = self.blocks[i](x, x0)
                     moe_z_loss = moe_z_loss + zl
                 skips.append(x)
@@ -2578,9 +2581,12 @@ class GPT(nn.Module):
                 j = self.num_encoder_layers + i
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
                 for s in range(n_rep):
-                    if n_rep > 1 and self.intra_loop_pos_emb.numel() > 0:
-                        emb = self.intra_loop_pos_emb[j - self.intra_loop_start, s]
-                        x = x + emb.to(dtype=x.dtype)
+                    if n_rep > 1 and len(self.intra_loop_controllers) > 0:
+                        ctrl = self.intra_loop_controllers[j - self.intra_loop_start]
+                        out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                        scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
+                        shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
+                        x = x * (1.0 + scale.tanh()) + shift
                     x, zl = self.blocks[j](x, x0)
                     moe_z_loss = moe_z_loss + zl
 
