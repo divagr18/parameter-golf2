@@ -199,6 +199,14 @@ class Hyperparameters:
     recurrent_core_layers = int(os.environ.get("RECURRENT_CORE_LAYERS", 0))
     recurrent_steps = int(os.environ.get("RECURRENT_STEPS", 0))
     share_ffn_across_blocks = bool(int(os.environ.get("SHARE_FFN_ACROSS_BLOCKS", "0")))
+    # Intra-layer recurrence: run layers [intra_loop_start..intra_loop_end] intra_loop_steps times.
+    # All blocks remain unique (no weight sharing), so parameter count is unchanged.
+    # Research (arXiv:2505.01855) shows front-loading repetitions on early layers maximises BPB gain.
+    # Example: INTRA_LOOP_START=0 INTRA_LOOP_END=2 INTRA_LOOP_STEPS=3 on a 9L model gives
+    # effective depth 9 + 2*3 = 15 with zero extra parameters.
+    intra_loop_start = int(os.environ.get("INTRA_LOOP_START", "-1"))  # -1 = disabled
+    intra_loop_end   = int(os.environ.get("INTRA_LOOP_END",   "-1"))
+    intra_loop_steps = int(os.environ.get("INTRA_LOOP_STEPS", "3"))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     # Mixture of Experts (MoE): replace dense MLPs with sparse expert routing.
     # MOE_NUM_EXPERTS=0  → disabled (dense MLP as usual)
@@ -2127,6 +2135,9 @@ class GPT(nn.Module):
         recurrent_core_layers: int = 0,
         recurrent_steps: int = 0,
         share_ffn_across_blocks: bool = False,
+        intra_loop_start: int = -1,
+        intra_loop_end: int = -1,
+        intra_loop_steps: int = 3,
         use_swiglu: bool = False,
         bigram_rank: int = 0,
         mtp_enabled: bool = False,
@@ -2168,6 +2179,12 @@ class GPT(nn.Module):
         self.recurrent_core_layers = recurrent_core_layers
         self.recurrent_steps = recurrent_steps
         self.share_ffn_across_blocks = share_ffn_across_blocks
+        # Intra-layer recurrence (research-backed: front-loaded repetitions improve BPB)
+        _intra_active = (intra_loop_start >= 0 and intra_loop_end >= intra_loop_start
+                         and intra_loop_steps > 1 and not self.use_recurrence)
+        self.intra_loop_start = int(intra_loop_start) if _intra_active else -1
+        self.intra_loop_end   = int(intra_loop_end)   if _intra_active else -1
+        self.intra_loop_steps = int(intra_loop_steps) if _intra_active else 1
         self.use_ssm = use_ssm
         self.ssm_every_n = ssm_every_n
         self.ssm_expand = ssm_expand
@@ -2189,9 +2206,13 @@ class GPT(nn.Module):
         self.copy_cache_gate_init = copy_cache_gate_init
         self.dual_head_enabled = bool(dual_head_enabled)
         self.dual_head_num_classes = max(2, int(dual_head_num_classes))
-        self.total_effective_layers = (
-            recurrent_core_layers * recurrent_steps if self.use_recurrence else num_layers
-        )
+        if self.use_recurrence:
+            self.total_effective_layers = recurrent_core_layers * recurrent_steps
+        elif self.intra_loop_start >= 0:
+            n_looped = self.intra_loop_end - self.intra_loop_start + 1
+            self.total_effective_layers = num_layers + n_looped * (self.intra_loop_steps - 1)
+        else:
+            self.total_effective_layers = num_layers
 
         # MoE config stored on model (used in forward() to gate the aux loss)
         self.moe_aux_loss_coeff = float(moe_aux_loss_coeff)
@@ -2413,12 +2434,17 @@ class GPT(nn.Module):
             skips: list[Tensor] = []
             # First half stores skips; second half reuses them in reverse order.
             for i in range(self.num_encoder_layers):
-                x, _ = self.blocks[i](x, x0)
+                n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
+                for _ in range(n_rep):
+                    x, _ = self.blocks[i](x, x0)
                 skips.append(x)
             for i in range(self.num_decoder_layers):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                x, _ = self.blocks[self.num_encoder_layers + i](x, x0)
+                j = self.num_encoder_layers + i
+                n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
+                for _ in range(n_rep):
+                    x, _ = self.blocks[j](x, x0)
         return self.final_norm(x)
 
     def forward_hidden_and_output(self, input_ids: Tensor) -> tuple[Tensor, Tensor, bool]:
@@ -2466,14 +2492,19 @@ class GPT(nn.Module):
             skips: list[Tensor] = []
             # First half stores skips; second half reuses them in reverse order.
             for i in range(self.num_encoder_layers):
-                x, zl = self.blocks[i](x, x0)
-                moe_z_loss = moe_z_loss + zl
+                n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
+                for _ in range(n_rep):
+                    x, zl = self.blocks[i](x, x0)
+                    moe_z_loss = moe_z_loss + zl
                 skips.append(x)
             for i in range(self.num_decoder_layers):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-                x, zl = self.blocks[self.num_encoder_layers + i](x, x0)
-                moe_z_loss = moe_z_loss + zl
+                j = self.num_encoder_layers + i
+                n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
+                for _ in range(n_rep):
+                    x, zl = self.blocks[j](x, x0)
+                    moe_z_loss = moe_z_loss + zl
 
         h = self.final_norm(x)
         flat_h = h.reshape(-1, h.size(-1))
@@ -2818,6 +2849,9 @@ def main() -> None:
         recurrent_core_layers=args.recurrent_core_layers,
         recurrent_steps=args.recurrent_steps,
         share_ffn_across_blocks=args.share_ffn_across_blocks,
+        intra_loop_start=args.intra_loop_start,
+        intra_loop_end=args.intra_loop_end,
+        intra_loop_steps=args.intra_loop_steps,
         use_swiglu=args.use_swiglu,
         bigram_rank=args.bigram_rank,
         mtp_enabled=args.mtp_enabled,
@@ -3048,10 +3082,16 @@ def main() -> None:
             f"share_ffn_across_blocks:{base_model.share_ffn_across_blocks}"
         )
     else:
+        intra_info = (
+            f" intra_loop:[{base_model.intra_loop_start}-{base_model.intra_loop_end}]x{base_model.intra_loop_steps}"
+            f" effective_layers:{base_model.total_effective_layers}"
+            if base_model.intra_loop_start >= 0 else ""
+        )
         log0(
             f"architecture:stacked num_layers:{args.num_layers} "
             f"encoder_layers:{base_model.num_encoder_layers} decoder_layers:{base_model.num_decoder_layers} "
             f"ssm_blocks:{base_model.num_ssm_blocks} attn_blocks:{base_model.num_attn_blocks}"
+            f"{intra_info}"
         )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "

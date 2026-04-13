@@ -131,6 +131,13 @@ export TIE_EMBEDDINGS="${TIE_EMBEDDINGS:-1}"
 export RECURRENT_CORE_LAYERS="${RECURRENT_CORE_LAYERS:-0}"   # FIX: was 3
 export RECURRENT_STEPS="${RECURRENT_STEPS:-0}"               # FIX: was 6
 export SHARE_FFN_ACROSS_BLOCKS="${SHARE_FFN_ACROSS_BLOCKS:-0}"
+# Intra-layer recurrence: loop layers [INTRA_LOOP_START..INTRA_LOOP_END] INTRA_LOOP_STEPS times.
+# Zero extra parameters — each block keeps unique weights, just re-executed.
+# Research: front-loading on early layers maximises BPB gain (arXiv:2505.01855).
+# E.g. INTRA_LOOP_START=0 INTRA_LOOP_END=2 INTRA_LOOP_STEPS=3 → 9L→15 eff layers, ~1.67x slower/step.
+export INTRA_LOOP_START="${INTRA_LOOP_START:--1}"   # -1 = disabled
+export INTRA_LOOP_END="${INTRA_LOOP_END:--1}"
+export INTRA_LOOP_STEPS="${INTRA_LOOP_STEPS:-3}"
 
 # SwiGLU: better activation than relu² at same parameter budget
 export USE_SWIGLU="${USE_SWIGLU:-0}"
