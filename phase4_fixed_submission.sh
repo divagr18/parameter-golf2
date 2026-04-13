@@ -139,6 +139,10 @@ export INTRA_LOOP_START="${INTRA_LOOP_START:--1}"   # -1 = disabled
 export INTRA_LOOP_END="${INTRA_LOOP_END:--1}"
 export INTRA_LOOP_STEPS="${INTRA_LOOP_STEPS:-3}"
 
+# Parallel residuals: attn and MLP run on same pre-norm input, outputs summed.
+# Saves one RMSNorm per block; improved gradient flow. Leaderboard PR #1477.
+export PARALLEL_RESIDUAL="${PARALLEL_RESIDUAL:-0}"
+
 # SwiGLU: better activation than relu² at same parameter budget
 export USE_SWIGLU="${USE_SWIGLU:-0}"
 
@@ -307,6 +311,7 @@ echo "grad_accum:     ${GRAD_ACCUM_STEPS}"
 echo "model:          dim=${MODEL_DIM} layers=${NUM_LAYERS} heads=${NUM_HEADS} kv=${NUM_KV_HEADS} mlp_mult=${MLP_MULT}"
 echo "recurrence:     core=${RECURRENT_CORE_LAYERS} steps=${RECURRENT_STEPS}  [FIX: was 3×6]"
 echo "use_swiglu:     ${USE_SWIGLU}"
+echo "parallel_resid: ${PARALLEL_RESIDUAL}"
 echo "moe:            experts=${MOE_NUM_EXPERTS} every_n=${MOE_EVERY_N} cap=${MOE_CAPACITY_FACTOR} aux=${MOE_AUX_LOSS_COEFF}"
 echo "qat:            scheme=${QAT_SCHEME} start_step=${QAT_START_STEP} lsq=${QAT_LSQ}"
 echo "gptq:           ${GPTQ} (nsamples=${GPTQ_NSAMPLES} blocksize=${GPTQ_BLOCKSIZE} percdamp=${GPTQ_PERCDAMP})"

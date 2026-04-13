@@ -207,6 +207,9 @@ class Hyperparameters:
     intra_loop_start = int(os.environ.get("INTRA_LOOP_START", "-1"))  # -1 = disabled
     intra_loop_end   = int(os.environ.get("INTRA_LOOP_END",   "-1"))
     intra_loop_steps = int(os.environ.get("INTRA_LOOP_STEPS", "3"))
+    # Parallel residuals: attn and MLP read same pre-norm input, outputs summed.
+    # One norm per block instead of two; improved gradient flow.  Leaderboard PR #1477.
+    use_parallel_residual = bool(int(os.environ.get("PARALLEL_RESIDUAL", "0")))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     # Mixture of Experts (MoE): replace dense MLPs with sparse expert routing.
     # MOE_NUM_EXPERTS=0  → disabled (dense MLP as usual)
@@ -2073,11 +2076,20 @@ class Block(nn.Module):
         ssm_kernel: int = 4,
         moe_num_experts: int = 0,
         moe_capacity_factor: float = 1.0,
+        use_parallel_residual: bool = False,
     ):
         super().__init__()
         self.use_ssm = use_ssm
-        self.attn_norm = RMSNorm()
-        self.mlp_norm = RMSNorm()
+        # Parallel residual: one shared pre-norm feeds both attn and MLP simultaneously.
+        # Saves one RMSNorm, improves gradient flow; validated by leaderboard PRs.
+        self.use_parallel_residual = use_parallel_residual and not use_ssm
+        if use_parallel_residual and not use_ssm:
+            self.norm = RMSNorm()      # single shared norm
+            self.attn_norm = self.norm  # alias for compat
+            self.mlp_norm  = self.norm  # alias for compat
+        else:
+            self.attn_norm = RMSNorm()
+            self.mlp_norm  = RMSNorm()
         if use_ssm:
             self.attn = None
             self.ssm = SSMMixer(dim, expand=ssm_expand, kernel_size=ssm_kernel)
@@ -2104,17 +2116,35 @@ class Block(nn.Module):
             if self.ssm is None:
                 raise RuntimeError("SSM block is enabled but mixer is missing")
             mix_out = self.ssm(self.attn_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * mix_out
+            mlp_out = self.mlp(self.mlp_norm(x))
+            z_loss = x.new_zeros(())
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        elif self.use_parallel_residual:
+            # Parallel: both attn and MLP read the same pre-norm input, outputs added together.
+            if self.attn is None:
+                raise RuntimeError("Attention block is enabled but attention module is missing")
+            h = self.norm(x)
+            attn_out = self.attn(h)
+            if self.is_moe:
+                mlp_out, z_loss = self.mlp(h)
+            else:
+                mlp_out = self.mlp(h)
+                z_loss = x.new_zeros(())
+            x = (x
+                 + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+                 + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out)
         else:
             if self.attn is None:
                 raise RuntimeError("Attention block is enabled but attention module is missing")
             mix_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * mix_out
-        if self.is_moe:
-            mlp_out, z_loss = self.mlp(self.mlp_norm(x))
-        else:
-            mlp_out = self.mlp(self.mlp_norm(x))
-            z_loss = x.new_zeros(())
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * mix_out
+            if self.is_moe:
+                mlp_out, z_loss = self.mlp(self.mlp_norm(x))
+            else:
+                mlp_out = self.mlp(self.mlp_norm(x))
+                z_loss = x.new_zeros(())
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x, z_loss
 
 
@@ -2138,6 +2168,7 @@ class GPT(nn.Module):
         intra_loop_start: int = -1,
         intra_loop_end: int = -1,
         intra_loop_steps: int = 3,
+        use_parallel_residual: bool = False,
         use_swiglu: bool = False,
         bigram_rank: int = 0,
         mtp_enabled: bool = False,
@@ -2250,6 +2281,7 @@ class GPT(nn.Module):
                         ssm_kernel=ssm_kernel,
                         moe_num_experts=moe_num_experts if is_moe_block(i) else 0,
                         moe_capacity_factor=moe_capacity_factor,
+                        use_parallel_residual=use_parallel_residual and not is_ssm_block(i),
                     )
                     for i in range(recurrent_core_layers)
                 ]
@@ -2290,15 +2322,31 @@ class GPT(nn.Module):
         self.num_ssm_blocks = sum(1 for block in self.blocks if block.use_ssm)
         self.num_moe_blocks = sum(1 for block in self.blocks if block.is_moe)
         self.num_attn_blocks = len(self.blocks) - self.num_ssm_blocks
-        # Loop-position embeddings: one [steps, dim] tensor per looped block (init=0).
-        # Added to hidden state before each iteration so the block can specialise per pass.
+        # Ouroboros-style loop controllers (arXiv:2604.02051): per-looped-block tiny hypernetwork.
+        # At each loop step, observes mean(x) → generates (scale, shift) ∈ R^dim each.
+        # Applied as x = x*(1+scale.tanh()) + shift before the block, making conditioning
+        # input-dependent rather than fixed — outperforms static per-step embeddings.
+        # Hidden=32 → params per controller: (dim*32 + 32*2*dim) ≈ 49K; negligible total.
         if _intra_active:
             n_looped = self.intra_loop_end - self.intra_loop_start + 1
-            self.intra_loop_pos_emb = nn.Parameter(
-                torch.zeros(n_looped, self.intra_loop_steps, model_dim)
-            )
+            _ctrl_hidden = 32
+            # One controller per looped block; each outputs [steps, 2, dim]
+            controllers = []
+            for _ in range(n_looped):
+                net = nn.Sequential(
+                    nn.Linear(model_dim, _ctrl_hidden, bias=True),
+                    nn.SiLU(),
+                    nn.Linear(_ctrl_hidden, self.intra_loop_steps * 2 * model_dim, bias=True),
+                )
+                # Zero-init output layer → identity transform at start of training
+                nn.init.zeros_(net[-1].weight)
+                nn.init.zeros_(net[-1].bias)
+                controllers.append(net)
+            self.intra_loop_controllers = nn.ModuleList(controllers)
+            self._intra_model_dim = model_dim
         else:
-            self.register_buffer("intra_loop_pos_emb", torch.zeros(0), persistent=False)
+            self.intra_loop_controllers = nn.ModuleList([])
+            self._intra_model_dim = model_dim
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         self.dual_head = CastedLinear(model_dim, self.dual_head_num_classes, bias=True) if self.dual_head_enabled else None
@@ -2448,9 +2496,12 @@ class GPT(nn.Module):
             for i in range(self.num_encoder_layers):
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
                 for s in range(n_rep):
-                    if n_rep > 1 and self.intra_loop_pos_emb.numel() > 0:
-                        emb = self.intra_loop_pos_emb[i - self.intra_loop_start, s]
-                        x = x + emb.to(dtype=x.dtype)
+                    if n_rep > 1 and len(self.intra_loop_controllers) > 0:
+                        ctrl = self.intra_loop_controllers[i - self.intra_loop_start]
+                        out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                        scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)  # [B,1,dim]
+                        shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)  # [B,1,dim]
+                        x = x * (1.0 + scale.tanh()) + shift
                     x, _ = self.blocks[i](x, x0)
                 skips.append(x)
             for i in range(self.num_decoder_layers):
@@ -2459,9 +2510,12 @@ class GPT(nn.Module):
                 j = self.num_encoder_layers + i
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
                 for s in range(n_rep):
-                    if n_rep > 1 and self.intra_loop_pos_emb.numel() > 0:
-                        emb = self.intra_loop_pos_emb[j - self.intra_loop_start, s]
-                        x = x + emb.to(dtype=x.dtype)
+                    if n_rep > 1 and len(self.intra_loop_controllers) > 0:
+                        ctrl = self.intra_loop_controllers[j - self.intra_loop_start]
+                        out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                        scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
+                        shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
+                        x = x * (1.0 + scale.tanh()) + shift
                     x, _ = self.blocks[j](x, x0)
         return self.final_norm(x)
 
@@ -2876,6 +2930,7 @@ def main() -> None:
         intra_loop_start=args.intra_loop_start,
         intra_loop_end=args.intra_loop_end,
         intra_loop_steps=args.intra_loop_steps,
+        use_parallel_residual=args.use_parallel_residual,
         use_swiglu=args.use_swiglu,
         bigram_rank=args.bigram_rank,
         mtp_enabled=args.mtp_enabled,
