@@ -2179,7 +2179,10 @@ class GPT(nn.Module):
         self.recurrent_core_layers = recurrent_core_layers
         self.recurrent_steps = recurrent_steps
         self.share_ffn_across_blocks = share_ffn_across_blocks
-        # Intra-layer recurrence (research-backed: front-loaded repetitions improve BPB)
+        # Partial depth recurrence: loop layers [intra_loop_start..intra_loop_end] N times.
+        # Middle layers are optimal (see Universal Transformers; leaderboard PR #1394).
+        # Loop-position embeddings (shape [n_looped_blocks, steps, dim], init=0) let the
+        # model distinguish iteration 0 from iteration 1, learned via Adam at scalar_lr.
         _intra_active = (intra_loop_start >= 0 and intra_loop_end >= intra_loop_start
                          and intra_loop_steps > 1 and not self.use_recurrence)
         self.intra_loop_start = int(intra_loop_start) if _intra_active else -1
@@ -2287,6 +2290,15 @@ class GPT(nn.Module):
         self.num_ssm_blocks = sum(1 for block in self.blocks if block.use_ssm)
         self.num_moe_blocks = sum(1 for block in self.blocks if block.is_moe)
         self.num_attn_blocks = len(self.blocks) - self.num_ssm_blocks
+        # Loop-position embeddings: one [steps, dim] tensor per looped block (init=0).
+        # Added to hidden state before each iteration so the block can specialise per pass.
+        if _intra_active:
+            n_looped = self.intra_loop_end - self.intra_loop_start + 1
+            self.intra_loop_pos_emb = nn.Parameter(
+                torch.zeros(n_looped, self.intra_loop_steps, model_dim)
+            )
+        else:
+            self.register_buffer("intra_loop_pos_emb", torch.zeros(0), persistent=False)
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         self.dual_head = CastedLinear(model_dim, self.dual_head_num_classes, bias=True) if self.dual_head_enabled else None
@@ -2435,7 +2447,10 @@ class GPT(nn.Module):
             # First half stores skips; second half reuses them in reverse order.
             for i in range(self.num_encoder_layers):
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
-                for _ in range(n_rep):
+                for s in range(n_rep):
+                    if n_rep > 1 and self.intra_loop_pos_emb.numel() > 0:
+                        emb = self.intra_loop_pos_emb[i - self.intra_loop_start, s]
+                        x = x + emb.to(dtype=x.dtype)
                     x, _ = self.blocks[i](x, x0)
                 skips.append(x)
             for i in range(self.num_decoder_layers):
@@ -2443,7 +2458,10 @@ class GPT(nn.Module):
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 j = self.num_encoder_layers + i
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
-                for _ in range(n_rep):
+                for s in range(n_rep):
+                    if n_rep > 1 and self.intra_loop_pos_emb.numel() > 0:
+                        emb = self.intra_loop_pos_emb[j - self.intra_loop_start, s]
+                        x = x + emb.to(dtype=x.dtype)
                     x, _ = self.blocks[j](x, x0)
         return self.final_norm(x)
 
@@ -2493,7 +2511,10 @@ class GPT(nn.Module):
             # First half stores skips; second half reuses them in reverse order.
             for i in range(self.num_encoder_layers):
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
-                for _ in range(n_rep):
+                for s in range(n_rep):
+                    if n_rep > 1 and self.intra_loop_pos_emb.numel() > 0:
+                        emb = self.intra_loop_pos_emb[i - self.intra_loop_start, s]
+                        x = x + emb.to(dtype=x.dtype)
                     x, zl = self.blocks[i](x, x0)
                     moe_z_loss = moe_z_loss + zl
                 skips.append(x)
@@ -2502,7 +2523,10 @@ class GPT(nn.Module):
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 j = self.num_encoder_layers + i
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
-                for _ in range(n_rep):
+                for s in range(n_rep):
+                    if n_rep > 1 and self.intra_loop_pos_emb.numel() > 0:
+                        emb = self.intra_loop_pos_emb[j - self.intra_loop_start, s]
+                        x = x + emb.to(dtype=x.dtype)
                     x, zl = self.blocks[j](x, x0)
                     moe_z_loss = moe_z_loss + zl
 
