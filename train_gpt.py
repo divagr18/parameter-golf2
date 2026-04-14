@@ -57,16 +57,16 @@ class Hyperparameters:
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 200))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
-    use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "0")))
+    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 5.0))
+    use_swiglu = bool(int(os.environ.get("USE_SWIGLU", "1")))
     # Sliding window eval: only score tokens beyond prefix_len in each window.
     # eval_stride_frac=0.5 means stride=seq_len//2 → each scored token has ≥seq_len//2 tokens of context.
     # eval_stride_frac=1.0 (default) = original non-overlapping behaviour.
-    eval_stride_frac = float(os.environ.get("EVAL_STRIDE_FRAC", "1.0"))
+    eval_stride_frac = float(os.environ.get("EVAL_STRIDE_FRAC", "0.5"))
     # Long-context eval: evaluate at a longer sequence length than training.
     # 0 = same as train_seq_len.  Pair with NTK RoPE scaling (eval_rope_scale>1) for best results.
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", "0"))
@@ -102,7 +102,7 @@ class Hyperparameters:
     # Low-rank bigram logit bias: learnable rank-r factored bigram table.
     # bigram_bias[i] = bigram_right(bigram_left(prev_token[i]))  added to logits before softcap.
     # 0 = disabled.  32 costs ~64K int8 params (≈32 KB), well within the 164 KB headroom.
-    bigram_rank = int(os.environ.get("BIGRAM_RANK", "0"))
+    bigram_rank = int(os.environ.get("BIGRAM_RANK", "32"))
     bigram_lr = float(os.environ.get("BIGRAM_LR", "0.04"))
     # Residual n-gram modeling: mix neural logits with a lightweight n-gram baseline.
     # total_prob = (1-gate)*P_neural + gate*P_ngram, where gate is learned per token.
@@ -143,14 +143,14 @@ class Hyperparameters:
     mtp_tie_embeddings = bool(int(os.environ.get("MTP_TIE_EMBEDDINGS", "1")))
     mtp_lr = float(os.environ.get("MTP_LR", "0.02"))
     # On-the-fly distillation (EMA teacher) in the late training tail.
-    distill_enabled = bool(int(os.environ.get("DISTILL_ENABLED", "0")))
+    distill_enabled = bool(int(os.environ.get("DISTILL_ENABLED", "1")))
     distill_start_frac = float(os.environ.get("DISTILL_START_FRAC", "0.7"))
     # Optional overrides for wallclock-capped runs. DISTILL_START_STEP wins over frac.
     # DISTILL_START_WALLCLOCK_FRAC keys distillation off elapsed/max_wallclock instead of ITERATIONS.
     distill_start_step = int(os.environ.get("DISTILL_START_STEP", "-1"))
     distill_start_wallclock_frac = float(os.environ.get("DISTILL_START_WALLCLOCK_FRAC", "-1.0"))
-    distill_weight = float(os.environ.get("DISTILL_WEIGHT", "0.1"))
-    distill_temp = float(os.environ.get("DISTILL_TEMP", "1.5"))
+    distill_weight = float(os.environ.get("DISTILL_WEIGHT", "0.08"))
+    distill_temp = float(os.environ.get("DISTILL_TEMP", "2.0"))
     distill_ema_decay = float(os.environ.get("DISTILL_EMA_DECAY", "0.999"))
     # JPCR: JEPA Predictive Coding Recurrence.  Replaces Ouroboros controllers with
     # representation predictors trained via JEPA loss (MSE) against EMA teacher intermediates.
@@ -196,7 +196,7 @@ class Hyperparameters:
     qat_lsq = bool(int(os.environ.get("QAT_LSQ", "0")))
 
     # GPTQ post-training quantization (replaces naive round-to-nearest at export).
-    gptq_enabled = bool(int(os.environ.get("GPTQ", "0")))
+    gptq_enabled = bool(int(os.environ.get("GPTQ", "1")))
     gptq_nsamples = int(os.environ.get("GPTQ_NSAMPLES", "128"))
     gptq_blocksize = int(os.environ.get("GPTQ_BLOCKSIZE", "128"))
     gptq_percdamp = float(os.environ.get("GPTQ_PERCDAMP", "0.01"))
@@ -216,9 +216,9 @@ class Hyperparameters:
     # Research (arXiv:2505.01855) shows front-loading repetitions on early layers maximises BPB gain.
     # Example: INTRA_LOOP_START=0 INTRA_LOOP_END=2 INTRA_LOOP_STEPS=3 on a 9L model gives
     # effective depth 9 + 2*3 = 15 with zero extra parameters.
-    intra_loop_start = int(os.environ.get("INTRA_LOOP_START", "-1"))  # -1 = disabled
-    intra_loop_end   = int(os.environ.get("INTRA_LOOP_END",   "-1"))
-    intra_loop_steps = int(os.environ.get("INTRA_LOOP_STEPS", "3"))
+    intra_loop_start = int(os.environ.get("INTRA_LOOP_START", "3"))  # -1 = disabled
+    intra_loop_end   = int(os.environ.get("INTRA_LOOP_END",   "4"))
+    intra_loop_steps = int(os.environ.get("INTRA_LOOP_STEPS", "2"))
     # Parallel residuals: attn and MLP read same pre-norm input, outputs summed.
     # One norm per block instead of two; improved gradient flow.  Leaderboard PR #1477.
     use_parallel_residual = bool(int(os.environ.get("PARALLEL_RESIDUAL", "0")))
@@ -2310,12 +2310,12 @@ class JPCRPredictor(nn.Module):
         gate_value: scalar in (0, 1) — how much to blend toward prediction
         """
         d = x.dtype
-        h = F.rms_norm(x.float(), (self.model_dim,))
-        h = F.silu(F.linear(h, self.proj_in.weight.float(), self.proj_in.bias.float()))
-        delta = F.linear(h, self.proj_out.weight.float(), self.proj_out.bias.float())
-        predicted_target = x.float() + delta
+        h = F.rms_norm(x, (self.model_dim,))
+        h = F.silu(self.proj_in(h))
+        delta = self.proj_out(h)
+        predicted_target = x + delta
         gate = torch.sigmoid(self.blend_gate)
-        return predicted_target.to(d), gate
+        return predicted_target, gate
 
 
 def _run_ctrl_safe(ctrl: nn.Sequential, x: Tensor, loop_steps: int, model_dim: int) -> Tensor:
@@ -3272,7 +3272,7 @@ def main() -> None:
         # qat_log_scale params are registered but sit idle until QAT activates.
         # Dual-head params can also be intentionally inactive during warmup / before
         # DUAL_HEAD_START_FRAC, so include that condition as well.
-        _ddp_find_unused = bool(args.qat_lsq or args.dual_head_enabled or args.jpcr_enabled)
+        _ddp_find_unused = bool(args.qat_lsq or args.dual_head_enabled)
         model = (
             DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=_ddp_find_unused)
             if device.type == "cuda"
