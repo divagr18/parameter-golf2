@@ -152,6 +152,18 @@ class Hyperparameters:
     distill_weight = float(os.environ.get("DISTILL_WEIGHT", "0.1"))
     distill_temp = float(os.environ.get("DISTILL_TEMP", "1.5"))
     distill_ema_decay = float(os.environ.get("DISTILL_EMA_DECAY", "0.999"))
+    # JPCR: JEPA Predictive Coding Recurrence.  Replaces Ouroboros controllers with
+    # representation predictors trained via JEPA loss (MSE) against EMA teacher intermediates.
+    # Each predictor learns to predict the "ideal" hidden state at this depth, then blends
+    # that prediction into the recurrence input — transforming blind repetition into
+    # JEPA-guided iterative refinement.  Progressive depth targeting: pass s of block i
+    # targets teacher's block (i+s) output, teaching the recurrence to "look ahead".
+    # At inference, predictors run as part of the model (no teacher needed).
+    jpcr_enabled = bool(int(os.environ.get("JPCR_ENABLED", "0")))
+    jpcr_hidden = int(os.environ.get("JPCR_HIDDEN", "128"))   # predictor MLP hidden dim
+    jpcr_weight = float(os.environ.get("JPCR_WEIGHT", "0.1"))  # JEPA MSE loss weight
+    jpcr_blend_init = float(os.environ.get("JPCR_BLEND_INIT", "-2.0"))  # logit for sigmoid gate init (~0.12)
+    jpcr_lr = float(os.environ.get("JPCR_LR", "0.02"))  # predictor learning rate
     # Dual-head objective: auxiliary coarse-structure prediction head.
     # Classes are derived from token properties (boundary/space/byte-length) and trained
     # with a small coefficient so the main LM head can focus on harder entropy.
@@ -2268,6 +2280,44 @@ class Block(nn.Module):
         return x, z_loss
 
 
+class JPCRPredictor(nn.Module):
+    """JEPA Predictive Coding Recurrence predictor.
+
+    Per-token MLP that predicts the "target" hidden representation at this depth.
+    Trained with MSE loss against EMA teacher intermediates (JEPA objective).
+    At inference, the prediction blends into the recurrence input via a learned gate,
+    steering the looped block toward better representations without requiring the teacher.
+
+    Architecture: RMSNorm → Linear(dim, hidden) → SiLU → Linear(hidden, dim) + residual
+    Output: predicted_target = x + delta, where delta is zero-initialized.
+    """
+
+    def __init__(self, model_dim: int, hidden_dim: int = 128, blend_init: float = -2.0):
+        super().__init__()
+        self.model_dim = model_dim
+        self.proj_in = nn.Linear(model_dim, hidden_dim, bias=True)
+        self.proj_out = nn.Linear(hidden_dim, model_dim, bias=True)
+        # Learnable blend gate (logit space). sigmoid(-2.0) ≈ 0.12 → conservative start.
+        self.blend_gate = nn.Parameter(torch.tensor(blend_init, dtype=torch.float32))
+        # Zero-init output → identity at start of training (delta = 0, predicted = x)
+        nn.init.zeros_(self.proj_out.weight)
+        nn.init.zeros_(self.proj_out.bias)
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        """Returns (predicted_target, gate_value).
+
+        predicted_target: [B, T, D] — where x 'should' be at this depth
+        gate_value: scalar in (0, 1) — how much to blend toward prediction
+        """
+        d = x.dtype
+        h = F.rms_norm(x.float(), (self.model_dim,))
+        h = F.silu(F.linear(h, self.proj_in.weight.float(), self.proj_in.bias.float()))
+        delta = F.linear(h, self.proj_out.weight.float(), self.proj_out.bias.float())
+        predicted_target = x.float() + delta
+        gate = torch.sigmoid(self.blend_gate)
+        return predicted_target.to(d), gate
+
+
 def _run_ctrl_safe(ctrl: nn.Sequential, x: Tensor, loop_steps: int, model_dim: int) -> Tensor:
     """Run Ouroboros controller with explicit dtype handling to avoid autocast/compile issues."""
     d = x.dtype
@@ -2325,6 +2375,9 @@ class GPT(nn.Module):
         moe_aux_loss_coeff: float = 1e-3,
         dual_head_enabled: bool = False,
         dual_head_num_classes: int = 4,
+        jpcr_enabled: bool = False,
+        jpcr_hidden: int = 128,
+        jpcr_blend_init: float = -2.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -2453,12 +2506,22 @@ class GPT(nn.Module):
         self.num_ssm_blocks = sum(1 for block in self.blocks if block.use_ssm)
         self.num_moe_blocks = sum(1 for block in self.blocks if block.is_moe)
         self.num_attn_blocks = len(self.blocks) - self.num_ssm_blocks
-        # Ouroboros-style loop controllers (arXiv:2604.02051): per-looped-block tiny hypernetwork.
-        # At each loop step, observes mean(x) → generates (scale, shift) ∈ R^dim each.
-        # Applied as x = x*(1+scale.tanh()) + shift before the block, making conditioning
-        # input-dependent rather than fixed — outperforms static per-step embeddings.
-        # Hidden=32 → params per controller: (dim*32 + 32*2*dim) ≈ 49K; negligible total.
-        if _intra_active:
+        # JPCR (JEPA Predictive Coding Recurrence) or Ouroboros loop conditioning.
+        # JPCR: per-token MLP predictors trained with JEPA MSE loss against teacher intermediates.
+        #   Each predictor predicts the ideal hidden state; a learned gate blends this prediction
+        #   into the recurrence input. Progressive depth targeting across loop iterations.
+        # Ouroboros: per-looped-block tiny hypernetwork generating (scale, shift) from mean(x).
+        self.jpcr_enabled = bool(jpcr_enabled) and _intra_active
+        if self.jpcr_enabled:
+            n_looped = self.intra_loop_end - self.intra_loop_start + 1
+            predictors = []
+            for _ in range(n_looped):
+                predictors.append(JPCRPredictor(model_dim, jpcr_hidden, jpcr_blend_init))
+            self.jpcr_predictors = nn.ModuleList(predictors)
+            self.intra_loop_controllers = nn.ModuleList([])  # not used with JPCR
+            self._intra_model_dim = model_dim
+        elif _intra_active:
+            self.jpcr_predictors = nn.ModuleList([])
             n_looped = self.intra_loop_end - self.intra_loop_start + 1
             _ctrl_hidden = 32
             # One controller per looped block; each outputs [steps, 2, dim]
@@ -2476,6 +2539,7 @@ class GPT(nn.Module):
             self.intra_loop_controllers = nn.ModuleList(controllers)
             self._intra_model_dim = model_dim
         else:
+            self.jpcr_predictors = nn.ModuleList([])
             self.intra_loop_controllers = nn.ModuleList([])
             self._intra_model_dim = model_dim
         self.final_norm = RMSNorm()
@@ -2613,6 +2677,21 @@ class GPT(nn.Module):
         )
         return mixed_log_probs.reshape(-1, mixed_log_probs.size(-1)).to(dtype=composed.dtype), True
 
+    def _apply_loop_conditioning(self, x: Tensor, block_idx: int, step: int) -> Tensor:
+        """Apply JPCR blend or Ouroboros conditioning before a looped block execution."""
+        if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
+            predictor = self.jpcr_predictors[block_idx - self.intra_loop_start]
+            predicted_target, gate = predictor(x)
+            # Blend: nudge current state toward predicted target
+            x = x + gate * (predicted_target - x)
+        elif len(self.intra_loop_controllers) > 0:
+            ctrl = self.intra_loop_controllers[block_idx - self.intra_loop_start]
+            out = _run_ctrl_safe(ctrl, x, self.intra_loop_steps, self._intra_model_dim)
+            scale = out[:, step, 0, :].unsqueeze(1).to(dtype=x.dtype)
+            shift = out[:, step, 1, :].unsqueeze(1).to(dtype=x.dtype)
+            x = x * (1.0 + scale.tanh()) + shift
+        return x
+
     def _forward_hidden(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
@@ -2623,16 +2702,11 @@ class GPT(nn.Module):
                     x, _ = block(x, x0)
         else:
             skips: list[Tensor] = []
-            # First half stores skips; second half reuses them in reverse order.
             for i in range(self.num_encoder_layers):
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
                 for s in range(n_rep):
-                    if n_rep > 1 and len(self.intra_loop_controllers) > 0:
-                        ctrl = self.intra_loop_controllers[i - self.intra_loop_start]
-                        out = _run_ctrl_safe(ctrl, x, self.intra_loop_steps, self._intra_model_dim)
-                        scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)  # [B,1,dim]
-                        shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)  # [B,1,dim]
-                        x = x * (1.0 + scale.tanh()) + shift
+                    if n_rep > 1:
+                        x = self._apply_loop_conditioning(x, i, s)
                     x, _ = self.blocks[i](x, x0)
                 skips.append(x)
             for i in range(self.num_decoder_layers):
@@ -2641,14 +2715,46 @@ class GPT(nn.Module):
                 j = self.num_encoder_layers + i
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
                 for s in range(n_rep):
-                    if n_rep > 1 and len(self.intra_loop_controllers) > 0:
-                        ctrl = self.intra_loop_controllers[j - self.intra_loop_start]
-                        out = _run_ctrl_safe(ctrl, x, self.intra_loop_steps, self._intra_model_dim)
-                        scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
-                        shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
-                        x = x * (1.0 + scale.tanh()) + shift
+                    if n_rep > 1:
+                        x = self._apply_loop_conditioning(x, j, s)
                     x, _ = self.blocks[j](x, x0)
         return self.final_norm(x)
+
+    def _forward_hidden_with_intermediates(self, input_ids: Tensor) -> tuple[Tensor, list[Tensor]]:
+        """Forward pass that captures hidden states after each block's FINAL pass.
+
+        Used by the EMA teacher to provide JEPA targets for JPCR predictors.
+        Returns (final_hidden_after_norm, list_of_per_block_hidden_states).
+        """
+        x = self.tok_emb(input_ids)
+        x = F.rms_norm(x, (x.size(-1),))
+        x0 = x
+        intermediates: list[Tensor] = []
+        if self.use_recurrence:
+            for _ in range(self.recurrent_steps):
+                for block in self.blocks:
+                    x, _ = block(x, x0)
+        else:
+            skips: list[Tensor] = []
+            for i in range(self.num_encoder_layers):
+                n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
+                for s in range(n_rep):
+                    if n_rep > 1:
+                        x = self._apply_loop_conditioning(x, i, s)
+                    x, _ = self.blocks[i](x, x0)
+                intermediates.append(x)  # capture after final pass of each block
+                skips.append(x)
+            for i in range(self.num_decoder_layers):
+                if skips:
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+                j = self.num_encoder_layers + i
+                n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
+                for s in range(n_rep):
+                    if n_rep > 1:
+                        x = self._apply_loop_conditioning(x, j, s)
+                    x, _ = self.blocks[j](x, x0)
+                intermediates.append(x)
+        return self.final_norm(x), intermediates
 
     def forward_hidden_and_output(self, input_ids: Tensor) -> tuple[Tensor, Tensor, bool]:
         h = self._forward_hidden(input_ids)
@@ -2669,6 +2775,22 @@ class GPT(nn.Module):
         _, logits, _ = self.forward_hidden_and_output(input_ids)
         return logits
 
+    def forward_logits_and_intermediates(self, input_ids: Tensor) -> tuple[Tensor, list[Tensor]]:
+        """Forward pass returning logits AND per-block hidden states for JPCR teacher."""
+        h, intermediates = self._forward_hidden_with_intermediates(input_ids)
+        flat_h = h.reshape(-1, h.size(-1))
+        if self.tie_embeddings:
+            logits_proj = F.linear(flat_h, self.tok_emb.weight)
+        else:
+            if self.lm_head is None:
+                raise RuntimeError("lm_head is required when tie_embeddings=False")
+            logits_proj = self.lm_head(flat_h)
+        if self.bigram_rank > 0:
+            bg = self.bigram_right(self.bigram_left(input_ids.reshape(-1)))
+            logits_proj = logits_proj + self.bigram_scale * bg
+        logits, _ = self._compose_output_logits(logits_proj, input_ids, h)
+        return logits, intermediates
+
     def forward(
         self,
         input_ids: Tensor,
@@ -2681,11 +2803,15 @@ class GPT(nn.Module):
         distill_weight: float = 0.0,
         distill_temp: float = 1.0,
         logit_reg_weight: float = 0.0,
+        jpcr_teacher_intermediates: list[Tensor] | None = None,
+        jpcr_weight: float = 0.0,
     ) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         moe_z_loss: Tensor = x.new_zeros(())   # accumulates router Z-losses from all MoE blocks
+        jpcr_loss: Tensor = x.new_zeros(())    # accumulates JEPA MSE losses from JPCR predictors
+        jpcr_count: int = 0                     # number of JPCR predictions for averaging
         if self.use_recurrence:
             for _ in range(self.recurrent_steps):
                 for block in self.blocks:
@@ -2697,12 +2823,27 @@ class GPT(nn.Module):
             for i in range(self.num_encoder_layers):
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
                 for s in range(n_rep):
-                    if n_rep > 1 and len(self.intra_loop_controllers) > 0:
-                        ctrl = self.intra_loop_controllers[i - self.intra_loop_start]
-                        out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
-                        scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
-                        shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
-                        x = x * (1.0 + scale.tanh()) + shift
+                    if n_rep > 1:
+                        if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
+                            predictor = self.jpcr_predictors[i - self.intra_loop_start]
+                            predicted_target, gate = predictor(x)
+                            # JEPA loss: MSE between prediction and teacher intermediate
+                            # Progressive depth targeting: pass s targets teacher block (i+s)
+                            if jpcr_teacher_intermediates is not None and jpcr_weight > 0.0:
+                                target_depth = min(i + s, len(jpcr_teacher_intermediates) - 1)
+                                teacher_target = jpcr_teacher_intermediates[target_depth]
+                                jpcr_loss = jpcr_loss + F.mse_loss(
+                                    predicted_target.float(), teacher_target.float()
+                                )
+                                jpcr_count += 1
+                            # Blend: nudge current state toward predicted target
+                            x = x + gate * (predicted_target - x)
+                        elif len(self.intra_loop_controllers) > 0:
+                            ctrl = self.intra_loop_controllers[i - self.intra_loop_start]
+                            out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                            scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
+                            shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
+                            x = x * (1.0 + scale.tanh()) + shift
                     x, zl = self.blocks[i](x, x0)
                     moe_z_loss = moe_z_loss + zl
                 skips.append(x)
@@ -2712,12 +2853,24 @@ class GPT(nn.Module):
                 j = self.num_encoder_layers + i
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
                 for s in range(n_rep):
-                    if n_rep > 1 and len(self.intra_loop_controllers) > 0:
-                        ctrl = self.intra_loop_controllers[j - self.intra_loop_start]
-                        out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
-                        scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
-                        shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
-                        x = x * (1.0 + scale.tanh()) + shift
+                    if n_rep > 1:
+                        if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
+                            predictor = self.jpcr_predictors[j - self.intra_loop_start]
+                            predicted_target, gate = predictor(x)
+                            if jpcr_teacher_intermediates is not None and jpcr_weight > 0.0:
+                                target_depth = min(j + s, len(jpcr_teacher_intermediates) - 1)
+                                teacher_target = jpcr_teacher_intermediates[target_depth]
+                                jpcr_loss = jpcr_loss + F.mse_loss(
+                                    predicted_target.float(), teacher_target.float()
+                                )
+                                jpcr_count += 1
+                            x = x + gate * (predicted_target - x)
+                        elif len(self.intra_loop_controllers) > 0:
+                            ctrl = self.intra_loop_controllers[j - self.intra_loop_start]
+                            out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                            scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
+                            shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
+                            x = x * (1.0 + scale.tanh()) + shift
                     x, zl = self.blocks[j](x, x0)
                     moe_z_loss = moe_z_loss + zl
 
@@ -2795,6 +2948,10 @@ class GPT(nn.Module):
                 reduction="batchmean",
             ) * (temp * temp if not logits_are_log_probs else 1.0)
             total_loss = total_loss + float(distill_weight) * kl
+
+        # JPCR (JEPA Predictive Coding Recurrence) loss: average MSE across all predictor outputs.
+        if jpcr_count > 0 and jpcr_weight > 0.0:
+            total_loss = total_loss + float(jpcr_weight) * (jpcr_loss / jpcr_count)
 
         # MoE router Z-loss — only during training (loss_mask is None means no sliding-window eval mask).
         # Follows the same pattern as MTP (excluded during eval to keep val_bpb clean).
@@ -3093,6 +3250,9 @@ def main() -> None:
         moe_aux_loss_coeff=args.moe_aux_loss_coeff,
         dual_head_enabled=args.dual_head_enabled,
         dual_head_num_classes=4,
+        jpcr_enabled=args.jpcr_enabled,
+        jpcr_hidden=args.jpcr_hidden,
+        jpcr_blend_init=args.jpcr_blend_init,
     ).to(device=device, dtype=torch.bfloat16 if autocast_enabled else torch.float32)
     if autocast_enabled:
         for module in base_model.modules():
@@ -3112,7 +3272,7 @@ def main() -> None:
         # qat_log_scale params are registered but sit idle until QAT activates.
         # Dual-head params can also be intentionally inactive during warmup / before
         # DUAL_HEAD_START_FRAC, so include that condition as well.
-        _ddp_find_unused = bool(args.qat_lsq or args.dual_head_enabled)
+        _ddp_find_unused = bool(args.qat_lsq or args.dual_head_enabled or args.jpcr_enabled)
         model = (
             DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=_ddp_find_unused)
             if device.type == "cuda"
@@ -3236,6 +3396,28 @@ def main() -> None:
                 fused=autocast_enabled,
             )
             optimizers.append(optimizer_mtp)
+    # JPCR predictor optimizer (also covers Ouroboros controllers if used)
+    if base_model.jpcr_enabled and len(base_model.jpcr_predictors) > 0:
+        jpcr_params: list[nn.Parameter] = list(base_model.jpcr_predictors.parameters())
+        if jpcr_params:
+            optimizer_jpcr = torch.optim.Adam(
+                [{"params": jpcr_params, "lr": args.jpcr_lr, "base_lr": args.jpcr_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                fused=autocast_enabled,
+            )
+            optimizers.append(optimizer_jpcr)
+    elif len(base_model.intra_loop_controllers) > 0:
+        # Ouroboros controllers need an optimizer too (was missing before!)
+        ctrl_params: list[nn.Parameter] = list(base_model.intra_loop_controllers.parameters())
+        if ctrl_params:
+            optimizer_ctrl = torch.optim.Adam(
+                [{"params": ctrl_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+                betas=(args.beta1, args.beta2),
+                eps=args.adam_eps,
+                fused=autocast_enabled,
+            )
+            optimizers.append(optimizer_ctrl)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -3309,11 +3491,15 @@ def main() -> None:
             f" effective_layers:{base_model.total_effective_layers}"
             if base_model.intra_loop_start >= 0 else ""
         )
+        jpcr_info = (
+            f" jpcr:hidden={args.jpcr_hidden},weight={args.jpcr_weight},blend_init={args.jpcr_blend_init},lr={args.jpcr_lr}"
+            if base_model.jpcr_enabled else ""
+        )
         log0(
             f"architecture:stacked num_layers:{args.num_layers} "
             f"encoder_layers:{base_model.num_encoder_layers} decoder_layers:{base_model.num_decoder_layers} "
             f"ssm_blocks:{base_model.num_ssm_blocks} attn_blocks:{base_model.num_attn_blocks}"
-            f"{intra_info}"
+            f"{intra_info}{jpcr_info}"
         )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
@@ -3556,6 +3742,7 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, curr_seq_len, grad_accum_steps)
             teacher_logits: Tensor | None = None
+            teacher_intermediates: list[Tensor] | None = None
             token_weights: Tensor | None = None
             aux_targets: Tensor | None = None
             train_loss_mask = build_train_loss_mask(x.size(0), curr_seq_len)
@@ -3563,7 +3750,13 @@ def main() -> None:
                 # Use no_grad (not inference_mode) because inference tensors can error when
                 # downstream ops save them for backward (e.g., KL in distillation under compile).
                 with torch.no_grad():
-                    teacher_logits = ema_teacher.forward_logits(x).detach()
+                    if base_model.jpcr_enabled and args.jpcr_weight > 0.0:
+                        # Capture both logits and per-block intermediates for JPCR
+                        teacher_logits, teacher_intermediates = ema_teacher.forward_logits_and_intermediates(x)
+                        teacher_logits = teacher_logits.detach()
+                        teacher_intermediates = [h.detach() for h in teacher_intermediates]
+                    else:
+                        teacher_logits = ema_teacher.forward_logits(x).detach()
             if args.byte_weighted_loss_enabled:
                 with torch.no_grad():
                     prev_ids = x.reshape(-1)
@@ -3600,6 +3793,8 @@ def main() -> None:
                         distill_weight=args.distill_weight if distill_active else 0.0,
                         distill_temp=args.distill_temp,
                         logit_reg_weight=args.logit_reg_weight,
+                        jpcr_teacher_intermediates=teacher_intermediates,
+                        jpcr_weight=args.jpcr_weight if distill_active else 0.0,
                     )
             else:
                 loss = model(
@@ -3613,6 +3808,8 @@ def main() -> None:
                     distill_weight=args.distill_weight if distill_active else 0.0,
                     distill_temp=args.distill_temp,
                     logit_reg_weight=args.logit_reg_weight,
+                    jpcr_teacher_intermediates=teacher_intermediates,
+                    jpcr_weight=args.jpcr_weight if distill_active else 0.0,
                 )
             train_loss += loss.detach()
             (loss * grad_scale).backward()
