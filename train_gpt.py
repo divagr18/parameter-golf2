@@ -1068,6 +1068,15 @@ INT4_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("INT4_KEEP_FLOAT_MAX_NUMEL", 65_5
 INT4_PER_ROW_SCALE_DTYPE = torch.float16
 INT4_CLIP_PERCENTILE = float(os.environ.get("INT4_CLIP_PERCENTILE", 99.995))
 INT4_CLIP_Q = INT4_CLIP_PERCENTILE / 100.0
+INT4_GROUP_SIZE = int(os.environ.get("INT4_GROUP_SIZE", "128"))  # 0 = per-row (legacy)
+
+# NF4 lookup table: 16 quantiles of N(0,1), information-theoretically optimal for normal weights.
+# Index 0..15 maps to these fixed float values. Quantize: find nearest, store index.
+NF4_ENABLED = bool(int(os.environ.get("NF4_ENABLED", "1")))
+NF4_LUT = torch.tensor([
+    -1.0, -0.6962, -0.5251, -0.3949, -0.2844, -0.1848, -0.0911, 0.0,
+     0.0796,  0.1609,  0.2461,  0.3379,  0.4407,  0.5626,  0.7230, 1.0,
+], dtype=torch.float32)
 MIXED_KEEP_FLOAT_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
@@ -1271,7 +1280,14 @@ def quantize_state_dict(
             gq, gs = gptq_results[name]
             if active_scheme == "int4":
                 packed = pack_int4_signed(gq)
-                meta = {"scheme": "int4_per_row", "axis": 0, "orig_shape": [int(t.shape[0]), int(t.shape[1])]}
+                if gs.ndim == 2:
+                    # Per-group scales: [rows, num_groups]
+                    scheme_name = "int4_per_group_nf4" if NF4_ENABLED else "int4_per_group"
+                    meta = {"scheme": scheme_name, "axis": 0,
+                            "orig_shape": [int(t.shape[0]), int(t.shape[1])],
+                            "group_size": INT4_GROUP_SIZE}
+                else:
+                    meta = {"scheme": "int4_per_row", "axis": 0, "orig_shape": [int(t.shape[0]), int(t.shape[1])]}
                 quantized[name] = packed
                 scales[name] = gs.to(dtype=INT4_PER_ROW_SCALE_DTYPE).contiguous()
             else:
@@ -1318,12 +1334,32 @@ def quantize_state_dict(
 # ---- GPTQ: Accurate Post-Training Quantization (Frantar et al., 2022) ----
 
 @torch.no_grad()
+def _nf4_quantize(w: Tensor, scale: Tensor) -> Tensor:
+    """Quantize values to NF4: find nearest NF4 level, return index in [-8, 7]."""
+    nf4 = NF4_LUT.to(w.device)  # [16]
+    normalized = w / scale.clamp(min=1e-8)  # normalized to ~[-1, 1]
+    # Find nearest NF4 level for each value
+    # nf4 has 16 values, indices 0..15, we store as signed [-8..7]
+    dists = (normalized.unsqueeze(-1) - nf4.unsqueeze(0)).abs()  # [rows, 16]
+    indices = dists.argmin(dim=-1)  # [rows] -> 0..15
+    return (indices - 8).to(torch.int8)  # shift to [-8, 7] for packing
+
+
+def _nf4_dequantize(q_signed: Tensor, scale: Tensor) -> Tensor:
+    """Dequantize NF4: index into LUT, multiply by scale."""
+    nf4 = NF4_LUT.to(q_signed.device)
+    indices = (q_signed.to(torch.int16) + 8).clamp(0, 15).long()
+    return nf4[indices] * scale
+
+
 def gptq_quantize_weight(
     W: Tensor,
     H: Tensor,
     bits: int = 4,
     percdamp: float = 0.01,
     blocksize: int = 128,
+    group_size: int = 0,
+    use_nf4: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """GPTQ-quantize a single weight matrix using Hessian information.
 
@@ -1333,10 +1369,12 @@ def gptq_quantize_weight(
         bits: 4 or 8
         percdamp: damping fraction of mean diagonal
         blocksize: column block size for lazy batch updates
+        group_size: columns per quantization group (0 = per-row)
+        use_nf4: use NF4 quantile levels instead of uniform (only for bits=4)
 
     Returns:
-        (Q_int8, scale_per_row) where Q_int8 holds the quantized integers
-        and scale_per_row is the per-row step size for dequantization.
+        (Q_int8, scale) where Q_int8 holds the quantized integers [-8..7] or [-127..127]
+        and scale is [rows] (per-row) or [rows, num_groups] (per-group).
     """
     device = W.device
     rows, cols = W.shape
@@ -1347,6 +1385,7 @@ def gptq_quantize_weight(
         maxq, minq, sym_max = 7, -8, 7.0
     else:
         maxq, minq, sym_max = 127, -127, 127.0
+    use_nf4 = use_nf4 and bits == 4  # NF4 only for 4-bit
 
     # Dead columns (no activation energy) → zero out weight and fix Hessian
     dead = torch.diag(H) == 0
@@ -1365,8 +1404,19 @@ def gptq_quantize_weight(
         H[diag, diag] += 10 * damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
 
-    # Per-row scale: max-abs / sym_max
-    scale = W.abs().amax(dim=1).clamp(min=1e-8) / sym_max
+    # Compute scales: per-row or per-group
+    if group_size > 0 and bits == 4:
+        num_groups = (cols + group_size - 1) // group_size
+        scale = torch.zeros(rows, num_groups, device=device)
+        for g in range(num_groups):
+            c0 = g * group_size
+            c1 = min(c0 + group_size, cols)
+            scale[:, g] = W[:, c0:c1].abs().amax(dim=1).clamp(min=1e-8)
+            if not use_nf4:
+                scale[:, g] /= sym_max
+    else:
+        num_groups = 0
+        scale = W.abs().amax(dim=1).clamp(min=1e-8) / sym_max
 
     Q = torch.zeros(rows, cols, dtype=torch.int8, device=device)
 
@@ -1379,13 +1429,25 @@ def gptq_quantize_weight(
             w = W[:, col]
             d = Hinv[col, col].clamp(min=1e-10)
 
-            q = torch.clamp(torch.round(w / scale), minq, maxq)
-            Q[:, col] = q.to(torch.int8)
+            # Get the scale for this column
+            if num_groups > 0:
+                col_scale = scale[:, col // group_size]
+            else:
+                col_scale = scale
 
-            err = (w - q * scale) / d
+            if use_nf4:
+                q = _nf4_quantize(w, col_scale)
+                Q[:, col] = q
+                w_hat = _nf4_dequantize(q, col_scale)
+            else:
+                q = torch.clamp(torch.round(w / col_scale), minq, maxq)
+                Q[:, col] = q.to(torch.int8)
+                w_hat = q * col_scale
+
+            err = (w - w_hat) / d
             Err1[:, j] = err
 
-            W[:, col] = q * scale  # replace with dequantized
+            W[:, col] = w_hat  # replace with dequantized
             if j + 1 < i2 - i1:
                 W[:, col + 1 : i2] -= err.unsqueeze(1) * Hinv[col, col + 1 : i2].unsqueeze(0)
 
@@ -1463,11 +1525,13 @@ def gptq_quantize_state_dict(
     bits: int = 4,
     percdamp: float = 0.01,
     blocksize: int = 128,
+    group_size: int = 0,
+    use_nf4: bool = False,
 ) -> dict[str, tuple[Tensor, Tensor]]:
     """Apply GPTQ to all CastedLinear weights that have Hessians.
 
-    Returns {state_dict_key: (Q_int8, scale_per_row)} for quantized 2D tensors.
-    Non-quantized tensors are not included.
+    Returns {state_dict_key: (Q_int8, scale)} for quantized 2D tensors.
+    scale is [rows] (per-row) or [rows, num_groups] (per-group).
     """
     device = next(model.parameters()).device
     results: dict[str, tuple[Tensor, Tensor]] = {}
@@ -1478,7 +1542,10 @@ def gptq_quantize_state_dict(
         if W.ndim != 2:
             continue
         H = hessians[name]
-        Q, scale = gptq_quantize_weight(W, H, bits=bits, percdamp=percdamp, blocksize=blocksize)
+        Q, scale = gptq_quantize_weight(
+            W, H, bits=bits, percdamp=percdamp, blocksize=blocksize,
+            group_size=group_size, use_nf4=use_nf4,
+        )
         results[name] = (Q.cpu(), scale.cpu())
     return results
 
@@ -1492,19 +1559,38 @@ def dequantize_state_dict(obj: dict[str, object]) -> dict[str, Tensor]:
         s = obj["scales"][name]
         meta = qmeta.get(name, {})
         meta_scheme = str(meta.get("scheme", ""))
-        if meta_scheme in {"int4_per_row", "int4_per_tensor"}:
+        if meta_scheme in {"int4_per_row", "int4_per_tensor", "int4_per_group", "int4_per_group_nf4"}:
             orig_shape = tuple(int(v) for v in meta.get("orig_shape", q.shape))
             numel = math.prod(orig_shape)
-            unpacked = unpack_int4_signed(q, numel).float()
-            if meta_scheme == "int4_per_row":
-                if len(orig_shape) != 2:
-                    raise ValueError(f"int4_per_row expects 2D orig_shape for tensor {name}, got {orig_shape}")
+            unpacked = unpack_int4_signed(q, numel)
+            if meta_scheme in {"int4_per_group", "int4_per_group_nf4"}:
+                rows, cols = orig_shape
+                group_size = int(meta.get("group_size", 128))
+                s_f = s.to(dtype=torch.float32)  # [rows, num_groups]
+                q_mat = unpacked.view(rows, cols)
+                if meta_scheme == "int4_per_group_nf4":
+                    # NF4 dequantization: index into LUT, then multiply by group scale
+                    nf4 = NF4_LUT  # [16]
+                    indices = (q_mat.to(torch.int16) + 8).clamp(0, 15).long()
+                    nf4_vals = nf4[indices]  # [rows, cols] in [-1, 1]
+                    # Expand group scales to per-column
+                    group_idx = torch.arange(cols) // group_size
+                    group_idx = group_idx.clamp(max=s_f.shape[1] - 1)
+                    col_scales = s_f[:, group_idx]  # [rows, cols]
+                    out[name] = (nf4_vals * col_scales).to(dtype=dtype).contiguous()
+                else:
+                    # Uniform int4 per-group dequantization
+                    group_idx = torch.arange(cols) // group_size
+                    group_idx = group_idx.clamp(max=s_f.shape[1] - 1)
+                    col_scales = s_f[:, group_idx]  # [rows, cols]
+                    out[name] = (unpacked.float().view(rows, cols) * col_scales).to(dtype=dtype).contiguous()
+            elif meta_scheme == "int4_per_row":
                 rows, cols = orig_shape
                 scale_row = s.to(dtype=torch.float32).view(rows, 1)
-                out[name] = (unpacked.view(rows, cols) * scale_row).to(dtype=dtype).contiguous()
+                out[name] = (unpacked.float().view(rows, cols) * scale_row).to(dtype=dtype).contiguous()
             else:
                 scale = float(s.item())
-                out[name] = (unpacked.view(orig_shape) * scale).to(dtype=dtype).contiguous()
+                out[name] = (unpacked.float().view(orig_shape) * scale).to(dtype=dtype).contiguous()
             continue
         if meta_scheme in {"int8_per_row", "per_row"} or (s.ndim > 0 and "int4" not in format_name):
             s = s.to(dtype=torch.float32)
@@ -3609,6 +3695,8 @@ def main() -> None:
             bits=gptq_bits,
             percdamp=args.gptq_percdamp,
             blocksize=args.gptq_blocksize,
+            group_size=INT4_GROUP_SIZE if gptq_bits == 4 else 0,
+            use_nf4=NF4_ENABLED if gptq_bits == 4 else False,
         )
         if master_process:
             log0(f"gptq: quantized {len(gptq_results)} weight matrices")
