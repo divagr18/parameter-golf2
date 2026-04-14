@@ -2152,6 +2152,17 @@ class Block(nn.Module):
         return x, z_loss
 
 
+def _run_ctrl_safe(ctrl: nn.Sequential, x: Tensor, loop_steps: int, model_dim: int) -> Tensor:
+    """Run Ouroboros controller with explicit dtype handling to avoid autocast/compile issues."""
+    d = x.dtype
+    h = x.mean(dim=1)  # [B, dim]
+    # Functional forward through controller: Linear -> SiLU -> Linear
+    h = F.linear(h, ctrl[0].weight.to(d), ctrl[0].bias.to(d))
+    h = F.silu(h)
+    h = F.linear(h, ctrl[2].weight.to(d), ctrl[2].bias.to(d))
+    return h.view(x.shape[0], loop_steps, 2, model_dim)
+
+
 class GPT(nn.Module):
     def __init__(
         self,
@@ -2502,8 +2513,7 @@ class GPT(nn.Module):
                 for s in range(n_rep):
                     if n_rep > 1 and len(self.intra_loop_controllers) > 0:
                         ctrl = self.intra_loop_controllers[i - self.intra_loop_start]
-                        ctrl_input = x.mean(dim=1).to(ctrl[0].weight.dtype)
-                        out = ctrl(ctrl_input).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                        out = _run_ctrl_safe(ctrl, x, self.intra_loop_steps, self._intra_model_dim)
                         scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)  # [B,1,dim]
                         shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)  # [B,1,dim]
                         x = x * (1.0 + scale.tanh()) + shift
@@ -2517,8 +2527,7 @@ class GPT(nn.Module):
                 for s in range(n_rep):
                     if n_rep > 1 and len(self.intra_loop_controllers) > 0:
                         ctrl = self.intra_loop_controllers[j - self.intra_loop_start]
-                        ctrl_input = x.mean(dim=1).to(ctrl[0].weight.dtype)
-                        out = ctrl(ctrl_input).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                        out = _run_ctrl_safe(ctrl, x, self.intra_loop_steps, self._intra_model_dim)
                         scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
                         shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
                         x = x * (1.0 + scale.tanh()) + shift
