@@ -11,7 +11,7 @@ set -euo pipefail
 #   PYTHON_BIN=python3.11
 #   VENV_DIR=.venv
 #   FORCE_CUDA_TORCH=1
-#   TORCH_VERSION=2.10.0
+#   TORCH_VERSION=2.6.0
 #   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 #   FINEWEB_VARIANT=sp1024
 #   TRAIN_SHARDS=80
@@ -22,7 +22,7 @@ cd "$(dirname "$0")"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV_DIR="${VENV_DIR:-.venv}"
 FORCE_CUDA_TORCH="${FORCE_CUDA_TORCH:-1}"
-TORCH_VERSION="${TORCH_VERSION:-2.10.0}"
+TORCH_VERSION="${TORCH_VERSION:-2.6.0}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 FINEWEB_VARIANT="${FINEWEB_VARIANT:-sp1024}"
 TRAIN_SHARDS="${TRAIN_SHARDS:-80}"
@@ -90,26 +90,29 @@ elapsed
 step "3/4  Python packages  (requirements.txt + zstandard)"
 # -------------------------------------------------------------------
 log "installing requirements.txt with uv ..."
-uv pip install --link-mode=copy -U -r requirements.txt
+uv pip install --link-mode=copy -r requirements.txt
 elapsed
 
 # zstandard: try pre-built binary first (no C compilation = no hangs).
 # Fall back to source build only if no wheel is available.
 log "installing zstandard (binary wheel preferred) ..."
-if uv pip install --link-mode=copy "zstandard>=0.22" --no-build 2>/dev/null; then
+_ZST_ERR=$(mktemp)
+if uv pip install --link-mode=copy "zstandard>=0.22" --no-build 2>"${_ZST_ERR}"; then
   log "zstandard installed from pre-built wheel"
-elif uv pip install --link-mode=copy "zstandard>=0.22" 2>/dev/null; then
+elif (cat "${_ZST_ERR}" >&2; uv pip install --link-mode=copy "zstandard>=0.22" 2>"${_ZST_ERR}"); then
   log "zstandard installed (compiled from source)"
 else
+  cat "${_ZST_ERR}" >&2
   log "WARNING: uv failed for zstandard, falling back to pip ..."
   pip install "zstandard>=0.22" --only-binary=:all: || pip install "zstandard>=0.22"
 fi
+rm -f "${_ZST_ERR}"
 elapsed
 
 if [[ "${FORCE_CUDA_TORCH}" == "1" ]]; then
   log "installing CUDA torch==${TORCH_VERSION} from ${TORCH_INDEX_URL} with uv ..."
   log "(this downloads ~2-3 GB — uv will cache and install rapidly)"
-  uv pip install --link-mode=copy -U "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}"
+  uv pip install --link-mode=copy -U "torch==${TORCH_VERSION}" --extra-index-url "${TORCH_INDEX_URL}"
   elapsed
 fi
 
