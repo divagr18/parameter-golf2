@@ -1360,7 +1360,6 @@ def gptq_quantize_weight(
     blocksize: int = 128,
     group_size: int = 0,
     use_nf4: bool = False,
-    act_order: bool = True,
 ) -> tuple[Tensor, Tensor]:
     """GPTQ-quantize a single weight matrix using Hessian information.
 
@@ -1372,7 +1371,6 @@ def gptq_quantize_weight(
         blocksize: column block size for lazy batch updates
         group_size: columns per quantization group (0 = per-row)
         use_nf4: use NF4 quantile levels instead of uniform (only for bits=4)
-        act_order: reorder columns by Hessian diagonal (importance) for lower error
 
     Returns:
         (Q_int8, scale) where Q_int8 holds the quantized integers [-8..7] or [-127..127]
@@ -1388,7 +1386,6 @@ def gptq_quantize_weight(
     else:
         maxq, minq, sym_max = 127, -127, 127.0
     use_nf4 = use_nf4 and bits == 4  # NF4 only for 4-bit
-    use_groups = group_size > 0 and bits == 4
 
     # Dead columns (no activation energy) → zero out weight and fix Hessian
     dead = torch.diag(H) == 0
@@ -1397,29 +1394,26 @@ def gptq_quantize_weight(
 
     # Damping for numerical stability
     damp = percdamp * torch.mean(torch.diag(H)).item()
-    diag_idx = torch.arange(cols, device=device)
-    H[diag_idx, diag_idx] += damp
-
-    # Act-order: sort columns by Hessian diagonal (most important first)
-    # Only use act-order without groups (act-order + groups is complex)
-    if act_order and bits == 4 and not use_groups:
-        perm = torch.argsort(torch.diag(H), descending=True)
-        W = W[:, perm]
-        H = H[perm][:, perm]
-    else:
-        perm = None
+    diag = torch.arange(cols, device=device)
+    H[diag, diag] += damp
 
     # Compute H^{-1} via Cholesky for stability
     try:
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
     except torch.linalg.LinAlgError:
-        H[diag_idx, diag_idx] += 10 * damp
+        H[diag, diag] += 10 * damp
         Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
 
-    # Compute scales: per-row or per-group (dynamically recomputed per group)
-    if use_groups:
+    # Compute scales: per-row or per-group
+    if group_size > 0 and bits == 4:
         num_groups = (cols + group_size - 1) // group_size
         scale = torch.zeros(rows, num_groups, device=device)
+        for g in range(num_groups):
+            c0 = g * group_size
+            c1 = min(c0 + group_size, cols)
+            scale[:, g] = W[:, c0:c1].abs().amax(dim=1).clamp(min=1e-8)
+            if not use_nf4:
+                scale[:, g] /= sym_max
     else:
         num_groups = 0
         scale = W.abs().amax(dim=1).clamp(min=1e-8) / sym_max
@@ -1430,32 +1424,13 @@ def gptq_quantize_weight(
         i2 = min(i1 + blocksize, cols)
         Err1 = torch.zeros(rows, i2 - i1, device=device)
 
-        # Dynamically compute group scale at group boundary from current W
-        if use_groups:
-            g = i1 // group_size
-            if i1 % group_size == 0:
-                c0 = g * group_size
-                c1 = min(c0 + group_size, cols)
-                scale[:, g] = W[:, c0:c1].abs().amax(dim=1).clamp(min=1e-8)
-                if not use_nf4:
-                    scale[:, g] /= sym_max
-
         for j in range(i2 - i1):
             col = i1 + j
             w = W[:, col]
             d = Hinv[col, col].clamp(min=1e-10)
 
-            # Recompute group scale at group boundary within a block
-            if use_groups and col > i1 and col % group_size == 0:
-                g = col // group_size
-                c0 = g * group_size
-                c1 = min(c0 + group_size, cols)
-                scale[:, g] = W[:, c0:c1].abs().amax(dim=1).clamp(min=1e-8)
-                if not use_nf4:
-                    scale[:, g] /= sym_max
-
             # Get the scale for this column
-            if use_groups:
+            if num_groups > 0:
                 col_scale = scale[:, col // group_size]
             else:
                 col_scale = scale
@@ -1479,11 +1454,6 @@ def gptq_quantize_weight(
         # Lazy batch update: propagate accumulated error to remaining columns
         if i2 < cols:
             W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
-
-    # Un-permute back to original column order (act-order only, no groups)
-    if perm is not None:
-        invperm = torch.argsort(perm)
-        Q = Q[:, invperm]
 
     return Q, scale
 
@@ -3855,3 +3825,173 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Running Python 3.11.10 (main, Sep  7 2024, 18:35:41) [GCC 11.4.0]
+Running PyTorch 2.10.0+cu128
+device:cuda:0 distributed:True use_torch_compile:True
+Tue Apr 14 20:34:42 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.126.09             Driver Version: 580.126.09     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:19:00.0 Off |                    0 |
+| N/A   34C    P0            120W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          On  |   00000000:3B:00.0 Off |                    0 |
+| N/A   32C    P0            116W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          On  |   00000000:4C:00.0 Off |                    0 |
+| N/A   30C    P0            117W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          On  |   00000000:5D:00.0 Off |                    0 |
+| N/A   35C    P0            116W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H100 80GB HBM3          On  |   00000000:9B:00.0 Off |                    0 |
+| N/A   35C    P0            122W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H100 80GB HBM3          On  |   00000000:BB:00.0 Off |                    0 |
+| N/A   32C    P0            120W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H100 80GB HBM3          On  |   00000000:CB:00.0 Off |                    0 |
+| N/A   33C    P0            119W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H100 80GB HBM3          On  |   00000000:DB:00.0 Off |                    0 |
+| N/A   32C    P0            121W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=./data/tokenizers/fineweb_1024_bpe.model
+train_loader:dataset:fineweb10B_sp1024 train_shards:80
+val_loader:shards pattern=./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin tokens:62021632 val_max_tokens:full
+eval_primary: seq_len:1024 rope_scale:1.0000 stride_frac:0.5000 final_eval_mode:primary
+eval_cont_cache: enabled:0 window:8192 topk:64 weight:0.1200 logit_scale:12.0000 conf_power:1.0000 batch_seqs:8
+train_loss_mask: enabled:0 stride_frac:0.5000
+model_params:16703625
+world_size:8 grad_accum_steps:1
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False mode=flash
+attention_mode:gqa num_heads:8 num_kv_heads:4 use_swiglu:True use_ssm:False ssm_every_n:2 ssm_expand:2.0 ssm_kernel:4 mtp_enabled:False mtp_steps:2 mtp_weight:0.3 mtp_decay:1.0 mtp_tie_embeddings:True distill_enabled:True distill_start_frac:0.7 distill_start_step:-1 distill_start_wallclock_frac:-1.0 distill_weight:0.08 distill_temp:2.0 distill_ema_decay:0.999 logit_reg_weight:0.0 byte_weighted_loss:False byte_weighted_loss_alpha:1.0 residual_ngram_enabled:False residual_bigram_rank:0 residual_trigram_rank:0 residual_ngram_lr:0.04 residual_ngram_mix_init:-2.5 copy_cache_enabled:False copy_cache_window:256 copy_cache_dim:64 copy_cache_lr:0.02 copy_cache_gate_init:-4.0 dual_head_enabled:False dual_head_weight:0.05 dual_head_start_frac:0.0 dual_head_lr:0.02 qat_scheme:none qat_start_step:9000 moe_num_experts:0 moe_every_n:2 moe_capacity_factor:1.0 moe_aux_loss_coeff:0.001 num_moe_blocks:0
+architecture:stacked num_layers:9 encoder_layers:4 decoder_layers:5 ssm_blocks:0 attn_blocks:9 intra_loop:[3-4]x2 effective_layers:11
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04 mtp_lr:0.0 copy_cache_lr:0.0 dual_head_lr:0.0
+train_batch_tokens:524288 train_seq_len:1024 iterations:20000 warmup_steps:200 max_wallclock_seconds:600.000
+seed:1337
+warmup_step:10/200
+warmup_step:20/200
+warmup_step:30/200
+warmup_step:40/200
+warmup_step:50/200
+warmup_step:60/200
+warmup_step:70/200
+warmup_step:80/200
+warmup_step:90/200
+warmup_step:100/200
+warmup_step:110/200
+warmup_step:120/200
+warmup_step:130/200
+warmup_step:140/200
+warmup_step:150/200
+warmup_step:160/200
+warmup_step:170/200
+warmup_step:180/200
+warmup_step:190/200
+warmup_step:200/200
+distill_start: mode:iter_frac:0.7000 resolved_step:14000
+step:1/20000 train_loss:6.9395 train_time:75ms step_avg:74.57ms
+step:2/20000 train_loss:16.7072 train_time:126ms step_avg:63.09ms
+step:3/20000 train_loss:7.8990 train_time:181ms step_avg:60.18ms
+step:4/20000 train_loss:6.5657 train_time:234ms step_avg:58.60ms
+step:5/20000 train_loss:7.3800 train_time:288ms step_avg:57.68ms
+step:6/20000 train_loss:8.0853 train_time:342ms step_avg:57.06ms
+step:7/20000 train_loss:6.8687 train_time:396ms step_avg:56.63ms
+step:8/20000 train_loss:6.3662 train_time:451ms step_avg:56.32ms
+step:9/20000 train_loss:5.9835 train_time:505ms step_avg:56.06ms
+step:10/20000 train_loss:5.7670 train_time:559ms step_avg:55.85ms
+step:200/20000 train_loss:2.7373 train_time:11516ms step_avg:57.58ms
+step:400/20000 train_loss:2.3018 train_time:22399ms step_avg:56.00ms
+step:600/20000 train_loss:2.5349 train_time:33316ms step_avg:55.53ms
+step:800/20000 train_loss:2.2809 train_time:44269ms step_avg:55.34ms
+step:1000/20000 train_loss:2.3644 train_time:55247ms step_avg:55.25ms
+step:1200/20000 train_loss:2.3748 train_time:68160ms step_avg:56.80ms
+step:1400/20000 train_loss:2.4209 train_time:79129ms step_avg:56.52ms
+step:1600/20000 train_loss:2.0850 train_time:90109ms step_avg:56.32ms
+step:1800/20000 train_loss:2.1957 train_time:101730ms step_avg:56.52ms
+step:2000/20000 train_loss:2.2458 train_time:113308ms step_avg:56.65ms
+step:2200/20000 train_loss:2.0651 train_time:124875ms step_avg:56.76ms
+step:2400/20000 train_loss:2.1924 train_time:135827ms step_avg:56.59ms
+step:2600/20000 train_loss:2.3996 train_time:147341ms step_avg:56.67ms
+step:2800/20000 train_loss:2.2281 train_time:158346ms step_avg:56.55ms
+step:3000/20000 train_loss:2.2191 train_time:169520ms step_avg:56.51ms
+step:3200/20000 train_loss:2.1829 train_time:180444ms step_avg:56.39ms
+step:3400/20000 train_loss:2.1465 train_time:191372ms step_avg:56.29ms
+step:3600/20000 train_loss:2.1011 train_time:202301ms step_avg:56.19ms
+step:3800/20000 train_loss:2.2086 train_time:213225ms step_avg:56.11ms
+step:4000/20000 train_loss:2.1548 train_time:224878ms step_avg:56.22ms
+step:4200/20000 train_loss:2.1628 train_time:235859ms step_avg:56.16ms
+step:4400/20000 train_loss:2.1001 train_time:246772ms step_avg:56.08ms
+step:4600/20000 train_loss:1.9623 train_time:257972ms step_avg:56.08ms
+step:4800/20000 train_loss:2.2534 train_time:269124ms step_avg:56.07ms
+step:5000/20000 train_loss:2.0207 train_time:280268ms step_avg:56.05ms
+step:5200/20000 train_loss:2.1671 train_time:291185ms step_avg:56.00ms
+step:5400/20000 train_loss:2.1756 train_time:302383ms step_avg:56.00ms
+step:5600/20000 train_loss:2.1730 train_time:313295ms step_avg:55.95ms
+step:5800/20000 train_loss:2.1349 train_time:324504ms step_avg:55.95ms
+step:6000/20000 train_loss:2.2139 train_time:335424ms step_avg:55.90ms
+step:6200/20000 train_loss:2.0726 train_time:346340ms step_avg:55.86ms
+step:6400/20000 train_loss:2.1486 train_time:357255ms step_avg:55.82ms
+step:6600/20000 train_loss:2.1100 train_time:368176ms step_avg:55.78ms
+step:6800/20000 train_loss:2.1821 train_time:379579ms step_avg:55.82ms
+step:7000/20000 train_loss:2.2147 train_time:390740ms step_avg:55.82ms
+step:7200/20000 train_loss:2.1823 train_time:401651ms step_avg:55.78ms
+step:7400/20000 train_loss:2.1064 train_time:412844ms step_avg:55.79ms
+step:7600/20000 train_loss:1.9897 train_time:423991ms step_avg:55.79ms
+step:7800/20000 train_loss:2.1378 train_time:435374ms step_avg:55.82ms
+step:8000/20000 train_loss:2.1007 train_time:447046ms step_avg:55.88ms
+step:8200/20000 train_loss:2.1730 train_time:459005ms step_avg:55.98ms
+step:8400/20000 train_loss:2.1200 train_time:470760ms step_avg:56.04ms
+step:8600/20000 train_loss:2.1139 train_time:482743ms step_avg:56.13ms
+step:8800/20000 train_loss:2.0754 train_time:494399ms step_avg:56.18ms
+step:9000/20000 train_loss:1.9926 train_time:506113ms step_avg:56.23ms
+step:9200/20000 train_loss:2.0525 train_time:517803ms step_avg:56.28ms
+step:9400/20000 train_loss:2.0898 train_time:530231ms step_avg:56.41ms
+step:9600/20000 train_loss:2.1065 train_time:541996ms step_avg:56.46ms
+step:9800/20000 train_loss:2.0254 train_time:553656ms step_avg:56.50ms
+step:10000/20000 train_loss:2.0680 train_time:565593ms step_avg:56.56ms
+step:10200/20000 train_loss:2.0176 train_time:577492ms step_avg:56.62ms
+step:10400/20000 train_loss:2.0445 train_time:589456ms step_avg:56.68ms
+step:10577/20000 val_loss:2.0043 val_bpb:1.1871 train_time:600056ms step_avg:56.73ms
+stopping_early: wallclock_cap train_time:600056ms step:10577/20000
+swa: loading averaged weights from 282 snapshots
+peak memory allocated: 14064 MiB reserved: 14200 MiB
+Serialized model: 65413943 bytes
+Code size: 181005 bytes
+Total submission size: 65594948 bytes
+submission_budget raw_total:65594948 budget:16000000 over_bytes:49594948
+gptq: collecting Hessians from 128 calibration samples...
+gptq: collected 64 Hessians, quantizing with bits=8...
+gptq: quantized 64 weight matrices
+export_config quant_scheme:int8 mixed_low_precision_scheme:int8 compressor:zstd weight_order:none compress_level:-1
+Serialized model int8+zstd: 15443285 bytes (payload:17060770 raw_torch:17115231 payload_ratio:3.83x)
+Total submission size int8+zstd: 15624290 bytes
+submission_budget int8+zstd total:15624290 budget:16000000 headroom_bytes:375710
+final_int8_zstd_roundtrip_ctx_exact name:primary seq_len:1024 rope_scale:1.0000 stride_frac:0.5000 val_loss:2.01638266 val_bpb:1.19421634
+final_int8_zstd_roundtrip val_loss:2.0164 val_bpb:1.1942 eval_time:8594ms mode:primary
+final_int8_zstd_roundtrip_exact val_loss:2.01638266 val_bpb:1.19421634 mode:primary

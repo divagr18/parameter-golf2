@@ -8,6 +8,15 @@ This file tracks the best-performing known settings for the 1-GPU 10-minute cap1
 - Primary metric: `final_*_roundtrip_exact val_bpb` (lower is better)
 - Hard constraint: `submission_budget ... total <= 16000000`
 
+## Best 8-GPU Non-Residual Run (current)
+- `RUN_ID=best8g_nonres_dist_s070_w008_t20`
+- Train-stop step/time: `13464` steps in `600s`
+- Pre-quant val: `val_bpb=1.1839`
+- Final roundtrip: `final_int8_zstd_roundtrip_exact val_bpb=1.19242312`
+- Budget: `int8+zstd total=15951668` (headroom `48332`)
+
+This is currently the strongest known non-residual 8-GPU result in this workspace.
+
 ---
 
 ## Current Locked Best Distill Knobs (1-GPU, 10 min, cap16)
