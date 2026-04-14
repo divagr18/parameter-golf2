@@ -1830,13 +1830,17 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        # Expand KV heads to match Q heads for GQA (handles older PyTorch without enable_gqa)
+        if self.num_kv_heads != self.num_heads:
+            groups = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(groups, dim=1)
+            v = v.repeat_interleave(groups, dim=1)
         y = F.scaled_dot_product_attention(
             q,
             k,
             v,
             attn_mask=None,
             is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
         )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
@@ -2498,7 +2502,8 @@ class GPT(nn.Module):
                 for s in range(n_rep):
                     if n_rep > 1 and len(self.intra_loop_controllers) > 0:
                         ctrl = self.intra_loop_controllers[i - self.intra_loop_start]
-                        out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                        ctrl_input = x.mean(dim=1).to(ctrl[0].weight.dtype)
+                        out = ctrl(ctrl_input).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
                         scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)  # [B,1,dim]
                         shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)  # [B,1,dim]
                         x = x * (1.0 + scale.tanh()) + shift
@@ -2512,7 +2517,8 @@ class GPT(nn.Module):
                 for s in range(n_rep):
                     if n_rep > 1 and len(self.intra_loop_controllers) > 0:
                         ctrl = self.intra_loop_controllers[j - self.intra_loop_start]
-                        out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                        ctrl_input = x.mean(dim=1).to(ctrl[0].weight.dtype)
+                        out = ctrl(ctrl_input).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
                         scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
                         shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
                         x = x * (1.0 + scale.tanh()) + shift
