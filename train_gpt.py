@@ -2952,6 +2952,9 @@ class GPT(nn.Module):
         # JPCR (JEPA Predictive Coding Recurrence) loss: average MSE across all predictor outputs.
         if jpcr_count > 0 and jpcr_weight > 0.0:
             total_loss = total_loss + float(jpcr_weight) * (jpcr_loss / jpcr_count)
+        elif self.jpcr_enabled and len(self.jpcr_predictors) > 0:
+            # Dummy usage so DDP sees gradients for predictor params even when loop is inactive.
+            total_loss = total_loss + 0.0 * sum(p.sum() for p in self.jpcr_predictors.parameters())
 
         # MoE router Z-loss — only during training (loss_mask is None means no sliding-window eval mask).
         # Follows the same pattern as MTP (excluded during eval to keep val_bpb clean).
