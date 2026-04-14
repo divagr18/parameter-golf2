@@ -1433,7 +1433,7 @@ def collect_gptq_hessians(
     model.eval()
     total_tokens = val_tokens.numel() - 1
     tokens_used = 0
-    with torch.inference_mode():
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         for i in range(0, total_tokens - seq_len, seq_len):
             if tokens_used >= nsamples * seq_len:
                 break
@@ -2498,7 +2498,7 @@ class GPT(nn.Module):
                 for s in range(n_rep):
                     if n_rep > 1 and len(self.intra_loop_controllers) > 0:
                         ctrl = self.intra_loop_controllers[i - self.intra_loop_start]
-                        out = ctrl(x.mean(dim=1).float()).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                        out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
                         scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)  # [B,1,dim]
                         shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)  # [B,1,dim]
                         x = x * (1.0 + scale.tanh()) + shift
@@ -2512,7 +2512,7 @@ class GPT(nn.Module):
                 for s in range(n_rep):
                     if n_rep > 1 and len(self.intra_loop_controllers) > 0:
                         ctrl = self.intra_loop_controllers[j - self.intra_loop_start]
-                        out = ctrl(x.mean(dim=1).float()).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                        out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
                         scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
                         shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
                         x = x * (1.0 + scale.tanh()) + shift
@@ -2568,7 +2568,7 @@ class GPT(nn.Module):
                 for s in range(n_rep):
                     if n_rep > 1 and len(self.intra_loop_controllers) > 0:
                         ctrl = self.intra_loop_controllers[i - self.intra_loop_start]
-                        out = ctrl(x.mean(dim=1).float()).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                        out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
                         scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
                         shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
                         x = x * (1.0 + scale.tanh()) + shift
@@ -2583,7 +2583,7 @@ class GPT(nn.Module):
                 for s in range(n_rep):
                     if n_rep > 1 and len(self.intra_loop_controllers) > 0:
                         ctrl = self.intra_loop_controllers[j - self.intra_loop_start]
-                        out = ctrl(x.mean(dim=1).float()).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                        out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
                         scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
                         shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
                         x = x * (1.0 + scale.tanh()) + shift
@@ -2968,6 +2968,12 @@ def main() -> None:
             if isinstance(module, CastedLinear):
                 module.float()
         restore_low_dim_params_to_fp32(base_model)
+    if use_compile:
+        # Disable DDPOptimizer: it splits compiled graphs at DDP bucket boundaries and
+        # crashes with `AttributeError: 'int' object has no attribute 'meta'` when plain
+        # Python int instance attrs (num_heads, head_dim) are captured as symbolic inputs
+        # to a subgraph. With world_size=1 the optimisation is a no-op anyway.
+        torch._dynamo.config.optimize_ddp = False
     compiled_model = torch.compile(base_model, dynamic=True) if use_compile else base_model
     model: nn.Module
     if distributed:
