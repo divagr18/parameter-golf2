@@ -2819,16 +2819,17 @@ class GPT(nn.Module):
                     moe_z_loss = moe_z_loss + zl
         else:
             skips: list[Tensor] = []
+            # Late loop activation: skip intra-loop when JPCR has no teacher signal yet.
+            # Before distill starts, predictors are zero-init (identity), so looping wastes compute.
+            loop_active = (jpcr_teacher_intermediates is not None) or not self.jpcr_enabled
             # First half stores skips; second half reuses them in reverse order.
             for i in range(self.num_encoder_layers):
-                n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
+                n_rep = (self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1) if loop_active else 1
                 for s in range(n_rep):
                     if n_rep > 1:
                         if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
                             predictor = self.jpcr_predictors[i - self.intra_loop_start]
                             predicted_target, gate = predictor(x)
-                            # JEPA loss: MSE between prediction and teacher intermediate
-                            # Progressive depth targeting: pass s targets teacher block (i+s)
                             if jpcr_teacher_intermediates is not None and jpcr_weight > 0.0:
                                 target_depth = min(i + s, len(jpcr_teacher_intermediates) - 1)
                                 teacher_target = jpcr_teacher_intermediates[target_depth]
@@ -2836,7 +2837,6 @@ class GPT(nn.Module):
                                     predicted_target.float(), teacher_target.float()
                                 )
                                 jpcr_count += 1
-                            # Blend: nudge current state toward predicted target
                             x = x + gate * (predicted_target - x)
                         elif len(self.intra_loop_controllers) > 0:
                             ctrl = self.intra_loop_controllers[i - self.intra_loop_start]
@@ -2851,7 +2851,7 @@ class GPT(nn.Module):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 j = self.num_encoder_layers + i
-                n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
+                n_rep = (self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1) if loop_active else 1
                 for s in range(n_rep):
                     if n_rep > 1:
                         if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
