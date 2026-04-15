@@ -2309,12 +2309,11 @@ class JPCRPredictor(nn.Module):
         predicted_target: [B, T, D] — where x 'should' be at this depth
         gate_value: scalar in (0, 1) — how much to blend toward prediction
         """
-        d = x.dtype
         h = F.rms_norm(x, (self.model_dim,))
         h = F.silu(self.proj_in(h))
         delta = self.proj_out(h)
         predicted_target = x + delta
-        gate = torch.sigmoid(self.blend_gate)
+        gate = torch.sigmoid(self.blend_gate.to(x.dtype))
         return predicted_target, gate
 
 
@@ -2705,7 +2704,7 @@ class GPT(nn.Module):
             for i in range(self.num_encoder_layers):
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
                 for s in range(n_rep):
-                    if n_rep > 1:
+                    if n_rep > 1 and s > 0:
                         x = self._apply_loop_conditioning(x, i, s)
                     x, _ = self.blocks[i](x, x0)
                 skips.append(x)
@@ -2715,7 +2714,7 @@ class GPT(nn.Module):
                 j = self.num_encoder_layers + i
                 n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
                 for s in range(n_rep):
-                    if n_rep > 1:
+                    if n_rep > 1 and s > 0:
                         x = self._apply_loop_conditioning(x, j, s)
                     x, _ = self.blocks[j](x, x0)
         return self.final_norm(x)
@@ -2819,7 +2818,7 @@ class GPT(nn.Module):
             for i in range(self.num_encoder_layers):
                 n_rep = (self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1) if loop_active else 1
                 for s in range(n_rep):
-                    if n_rep > 1:
+                    if n_rep > 1 and s > 0:
                         if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
                             predictor = self.jpcr_predictors[i - self.intra_loop_start]
                             predicted_target, gate = predictor(x)
@@ -2846,7 +2845,7 @@ class GPT(nn.Module):
                 j = self.num_encoder_layers + i
                 n_rep = (self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1) if loop_active else 1
                 for s in range(n_rep):
-                    if n_rep > 1:
+                    if n_rep > 1 and s > 0:
                         if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
                             predictor = self.jpcr_predictors[j - self.intra_loop_start]
                             predicted_target, gate = predictor(x)
@@ -2947,7 +2946,11 @@ class GPT(nn.Module):
             total_loss = total_loss + float(jpcr_weight) * (jpcr_loss / jpcr_count)
         elif self.jpcr_enabled and len(self.jpcr_predictors) > 0:
             # Dummy usage so DDP sees gradients for predictor params even when loop is inactive.
-            total_loss = total_loss + 0.0 * sum(p.sum() for p in self.jpcr_predictors.parameters())
+            # Use direct indexing to avoid generator-based graph breaks in torch.compile.
+            dummy = self.jpcr_predictors[0].proj_out.weight.sum() + self.jpcr_predictors[0].proj_out.bias.sum()
+            if len(self.jpcr_predictors) > 1:
+                dummy = dummy + self.jpcr_predictors[1].proj_out.weight.sum() + self.jpcr_predictors[1].proj_out.bias.sum()
+            total_loss = total_loss + 0.0 * dummy
 
         # MoE router Z-loss — only during training (loss_mask is None means no sliding-window eval mask).
         # Follows the same pattern as MTP (excluded during eval to keep val_bpb clean).
