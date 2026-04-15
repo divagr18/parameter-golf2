@@ -177,6 +177,12 @@ class Hyperparameters:
     dual_head_lr = float(os.environ.get("DUAL_HEAD_LR", "0.02"))
     # Logit range regularization on pre-softcap logits for quantization robustness.
     logit_reg_weight = float(os.environ.get("LOGIT_REG_WEIGHT", "0.0"))
+    # Sandwich norm: apply post-sublayer RMSNorm (before residual add) for each block.
+    # Controls residual stream norm growth; used by Gemma 2.
+    use_sandwich_norm = bool(int(os.environ.get("USE_SANDWICH_NORM", "0")))
+    # Embedding scale: multiply token embeddings by sqrt(model_dim) after lookup.
+    # Aligns embedding magnitude with residual stream scale. Used by Gemma, T5, PaLM.
+    embed_scale = bool(int(os.environ.get("EMBED_SCALE", "0")))
     # Byte-weighted training loss (align objective closer to tokenizer-agnostic BPB).
     byte_weighted_loss_enabled = bool(int(os.environ.get("BYTE_WEIGHTED_LOSS_ENABLED", "0")))
     byte_weighted_loss_alpha = float(os.environ.get("BYTE_WEIGHTED_LOSS_ALPHA", "1.0"))
@@ -2213,9 +2219,11 @@ class Block(nn.Module):
         moe_num_experts: int = 0,
         moe_capacity_factor: float = 1.0,
         use_parallel_residual: bool = False,
+        use_sandwich_norm: bool = False,
     ):
         super().__init__()
         self.use_ssm = use_ssm
+        self.use_sandwich_norm = use_sandwich_norm and not use_parallel_residual
         # Parallel residual: one shared pre-norm feeds both attn and MLP simultaneously.
         # Saves one RMSNorm, improves gradient flow; validated by leaderboard PRs.
         self.use_parallel_residual = use_parallel_residual and not use_ssm
@@ -2241,6 +2249,10 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # Sandwich norm: post-sublayer norms (Gemma 2 style). Applied before residual add.
+        if self.use_sandwich_norm:
+            self.attn_post_norm = RMSNorm()
+            self.mlp_post_norm  = RMSNorm()
 
     def forward(self, x: Tensor, x0: Tensor) -> tuple[Tensor, Tensor]:
         """Returns (hidden_state, moe_z_loss).
@@ -2274,12 +2286,16 @@ class Block(nn.Module):
             if self.attn is None:
                 raise RuntimeError("Attention block is enabled but attention module is missing")
             mix_out = self.attn(self.attn_norm(x))
+            if self.use_sandwich_norm:
+                mix_out = self.attn_post_norm(mix_out)
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * mix_out
             if self.is_moe:
                 mlp_out, z_loss = self.mlp(self.mlp_norm(x))
             else:
                 mlp_out = self.mlp(self.mlp_norm(x))
                 z_loss = x.new_zeros(())
+            if self.use_sandwich_norm:
+                mlp_out = self.mlp_post_norm(mlp_out)
             x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x, z_loss
 
@@ -2404,6 +2420,8 @@ class GPT(nn.Module):
         jpcr_hidden: int = 128,
         jpcr_proj_dim: int = 128,
         jpcr_blend_init: float = -2.0,
+        use_sandwich_norm: bool = False,
+        embed_scale: bool = False,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -2469,6 +2487,8 @@ class GPT(nn.Module):
             return moe_num_experts >= 2 and moe_every_n > 0 and idx % moe_every_n == 0
 
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.embed_scale = embed_scale
+        self._embed_scale_factor = model_dim ** 0.5 if embed_scale else 1.0
         if self.use_recurrence:
             self.num_encoder_layers = 0
             self.num_decoder_layers = 0
@@ -2492,6 +2512,7 @@ class GPT(nn.Module):
                         moe_num_experts=moe_num_experts if is_moe_block(i) else 0,
                         moe_capacity_factor=moe_capacity_factor,
                         use_parallel_residual=use_parallel_residual and not is_ssm_block(i),
+                        use_sandwich_norm=use_sandwich_norm,
                     )
                     for i in range(recurrent_core_layers)
                 ]
@@ -2521,6 +2542,7 @@ class GPT(nn.Module):
                         ssm_kernel=ssm_kernel,
                         moe_num_experts=moe_num_experts if is_moe_block(i) else 0,
                         moe_capacity_factor=moe_capacity_factor,
+                        use_sandwich_norm=use_sandwich_norm,
                     )
                     for i in range(num_layers)
                 ]
@@ -2720,6 +2742,8 @@ class GPT(nn.Module):
 
     def _forward_hidden(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
+        if self.embed_scale:
+            x = x * self._embed_scale_factor
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         if self.use_recurrence:
@@ -2755,6 +2779,8 @@ class GPT(nn.Module):
         Returns (final_hidden_after_norm, list_of_looped_block_hidden_states).
         """
         x = self.tok_emb(input_ids)
+        if self.embed_scale:
+            x = x * self._embed_scale_factor
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         intermediates: list[Tensor] = []
@@ -2831,6 +2857,8 @@ class GPT(nn.Module):
         if jpcr_teacher_intermediates is None:
             jpcr_teacher_intermediates = ()
         x = self.tok_emb(input_ids)
+        if self.embed_scale:
+            x = x * self._embed_scale_factor
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         moe_z_loss: Tensor = x.new_zeros(())   # accumulates router Z-losses from all MoE blocks
@@ -3281,6 +3309,8 @@ def main() -> None:
         jpcr_hidden=args.jpcr_hidden,
         jpcr_proj_dim=args.jpcr_hidden,  # projection dim = hidden dim for simplicity
         jpcr_blend_init=args.jpcr_blend_init,
+        use_sandwich_norm=args.use_sandwich_norm,
+        embed_scale=args.embed_scale,
     ).to(device=device, dtype=torch.bfloat16 if autocast_enabled else torch.float32)
     if autocast_enabled:
         for module in base_model.modules():
