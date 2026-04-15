@@ -3613,6 +3613,9 @@ def main() -> None:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        # Pre-build dummy tensors matching the main training loop signature so that
+        # torch.compile traces the correct graph during warmup (no re-trace at step 1).
+        _warmup_n_jpcr = (base_model.intra_loop_end - base_model.intra_loop_start + 1) if base_model.jpcr_enabled else 0
         for warmup_step in range(args.warmup_steps):
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
@@ -3620,11 +3623,35 @@ def main() -> None:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 warmup_loss_mask = build_train_loss_mask(x.size(0), args.train_seq_len)
+                # Use the same kwargs signature as the main loop so compile doesn't retrace later.
+                _wu_teacher_logits: Tensor = torch.empty(0, device=device)
+                _wu_intermediates: list[Tensor] = [
+                    torch.zeros(x.size(0), args.train_seq_len, args.model_dim, device=device, dtype=torch.bfloat16)
+                    for _ in range(_warmup_n_jpcr)
+                ] if _warmup_n_jpcr > 0 else []
                 if autocast_enabled:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                        warmup_loss = model(x, y, loss_mask=warmup_loss_mask)
+                        warmup_loss = model(
+                            x, y,
+                            loss_mask=warmup_loss_mask,
+                            distill_teacher_logits=_wu_teacher_logits,
+                            distill_weight=0.0,
+                            distill_temp=args.distill_temp,
+                            logit_reg_weight=0.0,
+                            jpcr_teacher_intermediates=_wu_intermediates,
+                            jpcr_weight=0.0,
+                        )
                 else:
-                    warmup_loss = model(x, y, loss_mask=warmup_loss_mask)
+                    warmup_loss = model(
+                        x, y,
+                        loss_mask=warmup_loss_mask,
+                        distill_teacher_logits=_wu_teacher_logits,
+                        distill_weight=0.0,
+                        distill_temp=args.distill_temp,
+                        logit_reg_weight=0.0,
+                        jpcr_teacher_intermediates=_wu_intermediates,
+                        jpcr_weight=0.0,
+                    )
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
