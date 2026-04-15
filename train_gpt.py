@@ -194,7 +194,7 @@ class Hyperparameters:
     ssm_kernel = int(os.environ.get("SSM_KERNEL", "4"))
     # Quantization-Aware Training: fake-quantise weights during forward to teach the model
     # to tolerate quantisation noise, dramatically reducing the roundtrip BPB penalty.
-    # QAT_SCHEME: "none" | "int8" | "int4"  (should match QUANT_SCHEME at export)
+    # QAT_SCHEME: "none" | "int8" | "int5" | "int4"  (should match QUANT_SCHEME at export)
     # QAT_START_STEP: delay QAT until the model has partially converged (avoids
     # destabilising early training. Rule of thumb: start at ~65% of expected total steps.
     # For 1-GPU ~6500-step runs: 4500. For 8-GPU ~13500-step runs: 9000.
@@ -1091,6 +1091,10 @@ INT4_PER_ROW_SCALE_DTYPE = torch.float16
 INT4_CLIP_PERCENTILE = float(os.environ.get("INT4_CLIP_PERCENTILE", 99.995))
 INT4_CLIP_Q = INT4_CLIP_PERCENTILE / 100.0
 INT4_GROUP_SIZE = int(os.environ.get("INT4_GROUP_SIZE", "128"))  # 0 = per-row (legacy)
+INT5_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("INT5_KEEP_FLOAT_MAX_NUMEL", 65_536))
+INT5_PER_ROW_SCALE_DTYPE = torch.float16
+INT5_CLIP_PERCENTILE = float(os.environ.get("INT5_CLIP_PERCENTILE", 99.997))
+INT5_CLIP_Q = INT5_CLIP_PERCENTILE / 100.0
 
 # NF4 lookup table: 16 quantiles of N(0,1), information-theoretically optimal for normal weights.
 # Index 0..15 maps to these fixed float values. Quantize: find nearest, store index.
@@ -1116,7 +1120,7 @@ MIXED_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     if pattern
 )
 MIXED_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("MIXED_KEEP_FLOAT_MAX_NUMEL", 65_536))
-SUPPORTED_QUANT_SCHEMES = {"int8", "int4", "mixed"}
+SUPPORTED_QUANT_SCHEMES = {"int8", "int5", "int4", "mixed"}
 SUPPORTED_COMPRESSORS = {"zlib", "zstd", "auto"}
 SUPPORTED_WEIGHT_ORDERS = {"none", "name", "size_desc", "dtype_name"}
 
@@ -1191,6 +1195,64 @@ def unpack_int4_signed(packed: Tensor, numel: int) -> Tensor:
     out[1::2] = high
     return out[:numel].to(dtype=torch.int8).contiguous()
 
+def pack_int5_signed(q_signed: Tensor) -> Tensor:
+    """Pack int5 values (range [-16,15]) stored as int8 into 5 bytes per 8 values (40 bits)."""
+    flat = q_signed.reshape(-1).to(dtype=torch.int32)
+    pad = (8 - flat.numel() % 8) % 8
+    if pad:
+        flat = torch.cat([flat, torch.zeros(pad, dtype=torch.int32)])
+    u = (flat + 16).to(torch.uint8).reshape(-1, 8)  # unsigned [0,31]
+    # 8 x uint5 → 5 bytes
+    b0 = (u[:, 0]       ) | ((u[:, 1] & 0x07) << 5)
+    b1 = (u[:, 1] >> 3  ) | ( u[:, 2]         << 2) | ((u[:, 3] & 0x01) << 7)
+    b2 = (u[:, 3] >> 1  ) | ((u[:, 4] & 0x0F) << 4)
+    b3 = (u[:, 4] >> 4  ) | ( u[:, 5]         << 1) | ((u[:, 6] & 0x03) << 6)
+    b4 = (u[:, 6] >> 2  ) | ( u[:, 7]         << 3)
+    packed = torch.stack([b0, b1, b2, b3, b4], dim=1).reshape(-1).to(torch.uint8)
+    return packed.contiguous()
+
+def unpack_int5_signed(packed: Tensor, numel: int) -> Tensor:
+    """Unpack int5 values from 5-bytes-per-8-values layout back to int8 [-16,15]."""
+    p = packed.reshape(-1, 5).to(torch.int32)
+    b0, b1, b2, b3, b4 = p[:, 0], p[:, 1], p[:, 2], p[:, 3], p[:, 4]
+    v0 =  b0        & 0x1F
+    v1 = ((b0 >> 5) & 0x07) | ((b1 & 0x03) << 3)
+    v2 = ( b1 >> 2) & 0x1F
+    v3 = ((b1 >> 7) & 0x01) | ((b2 & 0x0F) << 1)
+    v4 = ((b2 >> 4) & 0x0F) | ((b3 & 0x01) << 4)
+    v5 = ( b3 >> 1) & 0x1F
+    v6 = ((b3 >> 6) & 0x03) | ((b4 & 0x07) << 2)
+    v7 = ( b4 >> 3) & 0x1F
+    out = torch.stack([v0, v1, v2, v3, v4, v5, v6, v7], dim=1).reshape(-1)
+    return (out[:numel] - 16).to(torch.int8).contiguous()
+
+def quantize_float_tensor_int5(
+    t: Tensor, precomputed_scale: Tensor | None = None
+) -> tuple[Tensor, Tensor, dict[str, object]]:
+    t32 = t.float()
+    if t32.ndim == 2:
+        if precomputed_scale is not None:
+            scale = precomputed_scale.float().clamp_min(1.0 / 15.0)
+        else:
+            clip_abs = (
+                torch.quantile(t32.abs(), INT5_CLIP_Q, dim=1)
+                if t32.numel()
+                else torch.empty((t32.shape[0],), dtype=torch.float32)
+            )
+            scale = (clip_abs / 15.0).clamp_min(1.0 / 15.0)
+        q = torch.clamp(torch.round(t32 / scale[:, None]), -16, 15).to(torch.int8)
+        packed = pack_int5_signed(q)
+        return (
+            packed,
+            scale.to(dtype=INT5_PER_ROW_SCALE_DTYPE).contiguous(),
+            {"scheme": "int5_per_row", "axis": 0, "orig_shape": [int(t32.shape[0]), int(t32.shape[1])]},
+        )
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT5_CLIP_Q).item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / 15.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -16, 15).to(torch.int8)
+    packed = pack_int5_signed(q)
+    return packed, scale, {"scheme": "int5_per_tensor", "orig_shape": list(t32.shape)}
+
 def quantize_float_tensor_int4(
     t: Tensor, precomputed_scale: Tensor | None = None
 ) -> tuple[Tensor, Tensor, dict[str, object]]:
@@ -1231,17 +1293,18 @@ def quantize_state_dict(
         raise ValueError(f"Unsupported QUANT_SCHEME={scheme!r}; expected one of {sorted(SUPPORTED_QUANT_SCHEMES)}")
     if weight_order not in SUPPORTED_WEIGHT_ORDERS:
         raise ValueError(f"Unsupported WEIGHT_ORDER={weight_order!r}; expected one of {sorted(SUPPORTED_WEIGHT_ORDERS)}")
-    if mixed_low_precision_scheme not in {"int8", "int4"}:
+    if mixed_low_precision_scheme not in {"int8", "int5", "int4"}:
         raise ValueError(
-            f"Unsupported MIXED_LOW_PRECISION_SCHEME={mixed_low_precision_scheme!r}; expected 'int8' or 'int4'"
+            f"Unsupported MIXED_LOW_PRECISION_SCHEME={mixed_low_precision_scheme!r}; expected 'int8', 'int5', or 'int4'"
         )
 
     active_scheme = mixed_low_precision_scheme if scheme == "mixed" else scheme
-    format_name = (
-        f"{scheme}_clean_per_row_v1"
-        if active_scheme == "int8"
-        else f"{scheme}_clean_per_row_int4_v1"
-    )
+    if active_scheme == "int8":
+        format_name = f"{scheme}_clean_per_row_v1"
+    elif active_scheme == "int5":
+        format_name = f"{scheme}_clean_per_row_int5_v1"
+    else:
+        format_name = f"{scheme}_clean_per_row_int4_v1"
     # Single supported clean-script export formats:
     # - per-row low precision for 2D float tensors
     # - per-tensor low precision for other float tensors
@@ -1270,7 +1333,7 @@ def quantize_state_dict(
     keep_max_numel = (
         MIXED_KEEP_FLOAT_MAX_NUMEL
         if scheme == "mixed"
-        else (INT8_KEEP_FLOAT_MAX_NUMEL if active_scheme == "int8" else INT4_KEEP_FLOAT_MAX_NUMEL)
+        else (INT8_KEEP_FLOAT_MAX_NUMEL if active_scheme == "int8" else (INT5_KEEP_FLOAT_MAX_NUMEL if active_scheme == "int5" else INT4_KEEP_FLOAT_MAX_NUMEL))
     )
 
     for name, tensor in ordered_state_dict_items(state_dict, weight_order):
@@ -1300,7 +1363,12 @@ def quantize_state_dict(
         # GPTQ fast path: use pre-quantized (Q, scale) from Hessian-aware quantization
         if gptq_results is not None and name in gptq_results and t.ndim == 2:
             gq, gs = gptq_results[name]
-            if active_scheme == "int4":
+            if active_scheme == "int5":
+                packed = pack_int5_signed(gq)
+                meta = {"scheme": "int5_per_row", "axis": 0, "orig_shape": [int(t.shape[0]), int(t.shape[1])]}
+                quantized[name] = packed
+                scales[name] = gs.to(dtype=INT5_PER_ROW_SCALE_DTYPE).contiguous()
+            elif active_scheme == "int4":
                 packed = pack_int4_signed(gq)
                 if gs.ndim == 2:
                     # Per-group scales: [rows, num_groups]
@@ -1328,6 +1396,8 @@ def quantize_state_dict(
                 pre_scale = None  # shape mismatch → fall back to quantile
         if active_scheme == "int8":
             q, s, meta = quantize_float_tensor_int8(t, precomputed_scale=pre_scale)
+        elif active_scheme == "int5":
+            q, s, meta = quantize_float_tensor_int5(t, precomputed_scale=pre_scale)
         else:
             q, s, meta = quantize_float_tensor_int4(t, precomputed_scale=pre_scale)
         if meta:
@@ -1407,6 +1477,8 @@ def gptq_quantize_weight(
 
     if bits == 4:
         maxq, minq, sym_max = 7, -8, 7.0
+    elif bits == 5:
+        maxq, minq, sym_max = 15, -16, 15.0
     else:
         maxq, minq, sym_max = 127, -127, 127.0
     use_nf4 = use_nf4 and bits == 4  # NF4 only for 4-bit
@@ -1611,6 +1683,18 @@ def dequantize_state_dict(obj: dict[str, object]) -> dict[str, Tensor]:
         s = obj["scales"][name]
         meta = qmeta.get(name, {})
         meta_scheme = str(meta.get("scheme", ""))
+        if meta_scheme in {"int5_per_row", "int5_per_tensor"}:
+            orig_shape = tuple(int(v) for v in meta.get("orig_shape", q.shape))
+            numel = math.prod(orig_shape)
+            unpacked = unpack_int5_signed(q, numel)
+            if meta_scheme == "int5_per_row":
+                rows, cols = orig_shape
+                scale_row = s.to(dtype=torch.float32).view(rows, 1)
+                out[name] = (unpacked.float().view(rows, cols) * scale_row).to(dtype=dtype).contiguous()
+            else:
+                scale = float(s.item())
+                out[name] = (unpacked.float().view(orig_shape) * scale).to(dtype=dtype).contiguous()
+            continue
         if meta_scheme in {"int4_per_row", "int4_per_tensor", "int4_per_group", "int4_per_group_nf4"}:
             orig_shape = tuple(int(v) for v in meta.get("orig_shape", q.shape))
             numel = math.prod(orig_shape)
@@ -1795,7 +1879,7 @@ def _fake_quantize_row(w: Tensor, levels: int) -> Tensor:
     levels=256 → int8 symmetric (range −127…127)
     levels=16  → int4 symmetric (range −7…7)
     """
-    half = float(levels // 2 - (1 if levels == 16 else 0))  # 127 for int8, 7 for int4
+    half = float(levels // 2 - (1 if levels in (16, 32) else 0))  # 127 for int8, 15 for int5, 7 for int4
     w32 = w.float()
     clip_abs = w32.abs().amax(dim=1).clamp_min(1e-6)        # per-row max scale
     scale = clip_abs / half
@@ -1816,7 +1900,7 @@ def _fake_quantize_row_lsq(w: Tensor, levels: int, log_scale: Tensor) -> Tensor:
     Compared to max-abs fake-quant, LSQ lets the model adapt the clip threshold per row,
     reducing int4 quantisation error by ~30-50% on typical models.
     """
-    half = float(levels // 2 - (1 if levels == 16 else 0))
+    half = float(levels // 2 - (1 if levels in (16, 32) else 0))
     w32 = w.float()
     # LSQ gradient scaling trick: effective gradient on log_scale is g * d_loss/d_scale.
     numel_per_row = float(w32.shape[1])
@@ -1831,7 +1915,7 @@ def _fake_quantize_row_lsq(w: Tensor, levels: int, log_scale: Tensor) -> Tensor:
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    # QAT: set qat_levels to 256 (int8) or 16 (int4) to enable fake-quantisation.
+    # QAT: set qat_levels to 256 (int8), 32 (int5), or 16 (int4) to enable fake-quantisation.
     qat_levels: int = 0   # class-level switch updated from the training loop
     # LSQ: when True, CastedLinear instances allocate a learnable per-row log-scale parameter
     # used in place of the max-abs scale. Must be set BEFORE model construction.
@@ -1864,7 +1948,7 @@ def init_lsq_scales(model: nn.Module, levels: int) -> int:
     log(max_abs_per_row / half), matching the initial value a max-abs fake-quant would use.
     Returns the number of CastedLinear modules initialised.
     """
-    half = float(levels // 2 - (1 if levels == 16 else 0))
+    half = float(levels // 2 - (1 if levels in (16, 32) else 0))
     count = 0
     with torch.no_grad():
         for m in model.modules():
@@ -3779,6 +3863,12 @@ def main() -> None:
                 target_levels = 0
             elif args.qat_scheme == "int8":
                 target_levels = 256
+            elif args.qat_scheme == "int5":
+                # Progressive: int8 warmup → int6 intermediate → int5 target
+                qat_elapsed = step - args.qat_start_step
+                qat_window = max(args.iterations - args.qat_start_step, 1)
+                frac = qat_elapsed / qat_window
+                target_levels = 256 if frac < 0.33 else (64 if frac < 0.67 else 32)
             else:  # int4 progressive
                 qat_elapsed = step - args.qat_start_step
                 qat_window = max(args.iterations - args.qat_start_step, 1)
@@ -4014,7 +4104,7 @@ def main() -> None:
     # GPTQ: Hessian-aware post-training quantization (replaces naive round-to-nearest).
     gptq_results: dict[str, tuple[Tensor, Tensor]] | None = None
     if args.gptq_enabled:
-        gptq_bits = 4 if args.quant_scheme in ("int4", "mixed") else 8
+        gptq_bits = 4 if args.quant_scheme in ("int4", "mixed") else (5 if args.quant_scheme == "int5" else 8)
         if master_process:
             log0(f"gptq: collecting Hessians from {args.gptq_nsamples} calibration samples...")
         CastedLinear.qat_levels = 0  # disable fake-quant for calibration
