@@ -3295,7 +3295,7 @@ def main() -> None:
         torch._dynamo.config.optimize_ddp = False
     # Pre-warm rotary caches at full seq_len before torch.compile to stabilize graph identity.
     # Without this, _cos_cached gets rebuilt mid-training causing dynamo recompilations.
-    with torch.no_grad():
+    with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
         _dummy = torch.zeros(1, args.train_seq_len, dtype=torch.long, device=device)
         base_model(_dummy, _dummy)
         del _dummy
