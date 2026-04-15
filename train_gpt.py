@@ -2828,6 +2828,8 @@ class GPT(nn.Module):
         jpcr_teacher_intermediates: list[Tensor] | None = (),
         jpcr_weight: float = 0.0,
     ) -> Tensor:
+        if jpcr_teacher_intermediates is None:
+            jpcr_teacher_intermediates = ()
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -2950,7 +2952,7 @@ class GPT(nn.Module):
         if logit_reg_weight > 0.0:
             total_loss = total_loss + float(logit_reg_weight) * logits_proj.float().pow(2).mean()
 
-        if distill_teacher_logits.numel() > 0 and distill_weight > 0.0:
+        if distill_teacher_logits is not None and distill_teacher_logits.numel() > 0 and distill_weight > 0.0:
             temp = max(float(distill_temp), 1e-4)
             if logits_are_log_probs:
                 student_log_probs = logits.float()
