@@ -2825,9 +2825,10 @@ class GPT(nn.Module):
                             if jpcr_teacher_intermediates is not None and jpcr_weight > 0.0:
                                 target_depth = min(i + s, len(jpcr_teacher_intermediates) - 1)
                                 teacher_target = jpcr_teacher_intermediates[target_depth]
-                                jpcr_loss = jpcr_loss + F.mse_loss(
-                                    predicted_target.float(), teacher_target.float()
-                                )
+                                # Normalized MSE (cosine distance) — scale-invariant, bounded loss
+                                pred_norm = F.normalize(predicted_target.float(), dim=-1)
+                                tgt_norm = F.normalize(teacher_target.float(), dim=-1)
+                                jpcr_loss = jpcr_loss + F.mse_loss(pred_norm, tgt_norm)
                                 jpcr_count += 1
                             x = x + gate * (predicted_target - x)
                         elif len(self.intra_loop_controllers) > 0:
@@ -2852,9 +2853,9 @@ class GPT(nn.Module):
                             if jpcr_teacher_intermediates is not None and jpcr_weight > 0.0:
                                 target_depth = min(j + s, len(jpcr_teacher_intermediates) - 1)
                                 teacher_target = jpcr_teacher_intermediates[target_depth]
-                                jpcr_loss = jpcr_loss + F.mse_loss(
-                                    predicted_target.float(), teacher_target.float()
-                                )
+                                pred_norm = F.normalize(predicted_target.float(), dim=-1)
+                                tgt_norm = F.normalize(teacher_target.float(), dim=-1)
+                                jpcr_loss = jpcr_loss + F.mse_loss(pred_norm, tgt_norm)
                                 jpcr_count += 1
                             x = x + gate * (predicted_target - x)
                         elif len(self.intra_loop_controllers) > 0:
