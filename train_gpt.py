@@ -3294,7 +3294,6 @@ def main() -> None:
         # to a subgraph. With world_size=1 the optimisation is a no-op anyway.
         torch._dynamo.config.optimize_ddp = False
     # Pre-warm rotary caches at full seq_len before torch.compile to stabilize graph identity.
-    # Without this, _cos_cached gets rebuilt mid-training causing dynamo recompilations.
     with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
         _dummy = torch.zeros(1, args.train_seq_len, dtype=torch.long, device=device)
         base_model(_dummy, _dummy)
