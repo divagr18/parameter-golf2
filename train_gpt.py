@@ -2841,9 +2841,10 @@ class GPT(nn.Module):
                     moe_z_loss = moe_z_loss + zl
         else:
             skips: list[Tensor] = []
-            # Late loop activation: skip intra-loop when JPCR has no teacher signal yet.
-            # Before distill starts, predictors are zero-init (identity), so looping wastes compute.
-            loop_active = (jpcr_teacher_intermediates is not None) or not self.jpcr_enabled
+            # Always run the intra-loop to keep the torch.compile graph structure constant.
+            # Before distill, JPCR predictors are zero-init (identity blend), so the loop
+            # is a mild overhead but avoids a catastrophic dynamo recompilation stall.
+            loop_active = True
             # First half stores skips; second half reuses them in reverse order.
             for i in range(self.num_encoder_layers):
                 n_rep = (self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1) if loop_active else 1
@@ -2852,7 +2853,7 @@ class GPT(nn.Module):
                         if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
                             predictor = self.jpcr_predictors[i - self.intra_loop_start]
                             predicted_target, gate = predictor(x)
-                            if jpcr_teacher_intermediates is not None and jpcr_weight > 0.0:
+                            if len(jpcr_teacher_intermediates) > 0 and jpcr_weight > 0.0:
                                 target_idx = i - self.intra_loop_start
                                 if target_idx < len(jpcr_teacher_intermediates):
                                     teacher_target = jpcr_teacher_intermediates[target_idx]
@@ -2878,7 +2879,7 @@ class GPT(nn.Module):
                         if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
                             predictor = self.jpcr_predictors[j - self.intra_loop_start]
                             predicted_target, gate = predictor(x)
-                            if jpcr_teacher_intermediates is not None and jpcr_weight > 0.0:
+                            if len(jpcr_teacher_intermediates) > 0 and jpcr_weight > 0.0:
                                 target_idx = j - self.intra_loop_start
                                 if target_idx < len(jpcr_teacher_intermediates):
                                     teacher_target = jpcr_teacher_intermediates[target_idx]
@@ -2948,7 +2949,7 @@ class GPT(nn.Module):
         if logit_reg_weight > 0.0:
             total_loss = total_loss + float(logit_reg_weight) * logits_proj.float().pow(2).mean()
 
-        if distill_teacher_logits is not None and distill_weight > 0.0:
+        if distill_teacher_logits.numel() > 0 and distill_weight > 0.0:
             temp = max(float(distill_temp), 1e-4)
             if logits_are_log_probs:
                 student_log_probs = logits.float()
@@ -3305,7 +3306,7 @@ def main() -> None:
         # qat_log_scale params are registered but sit idle until QAT activates.
         # Dual-head params can also be intentionally inactive during warmup / before
         # DUAL_HEAD_START_FRAC, so include that condition as well.
-        _ddp_find_unused = bool(args.qat_lsq or args.dual_head_enabled or args.jpcr_enabled)
+        _ddp_find_unused = bool(args.qat_lsq or args.dual_head_enabled)
         model = (
             DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=_ddp_find_unused)
             if device.type == "cuda"
@@ -3788,8 +3789,10 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, curr_seq_len, grad_accum_steps)
-            teacher_logits: Tensor | None = None
-            teacher_intermediates: list[Tensor] | None = None
+            # Always pass consistent types to forward() to avoid torch.compile retracing
+            # when distillation activates. Use empty tensors / empty lists instead of None.
+            teacher_logits: Tensor = torch.empty(0, device=device)
+            teacher_intermediates: list[Tensor] = []
             token_weights: Tensor | None = None
             aux_targets: Tensor | None = None
             train_loss_mask = build_train_loss_mask(x.size(0), curr_seq_len)
