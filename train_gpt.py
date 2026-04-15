@@ -2825,7 +2825,7 @@ class GPT(nn.Module):
         distill_weight: float = 0.0,
         distill_temp: float = 1.0,
         logit_reg_weight: float = 0.0,
-        jpcr_teacher_intermediates: list[Tensor] | None = None,
+        jpcr_teacher_intermediates: list[Tensor] | None = (),
         jpcr_weight: float = 0.0,
     ) -> Tensor:
         x = self.tok_emb(input_ids)
@@ -2853,16 +2853,18 @@ class GPT(nn.Module):
                         if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
                             predictor = self.jpcr_predictors[i - self.intra_loop_start]
                             predicted_target, gate = predictor(x)
-                            if len(jpcr_teacher_intermediates) > 0 and jpcr_weight > 0.0:
-                                target_idx = i - self.intra_loop_start
-                                if target_idx < len(jpcr_teacher_intermediates):
-                                    teacher_target = jpcr_teacher_intermediates[target_idx]
-                                    jpcr_loss = jpcr_loss + predictor.compute_loss(predicted_target, teacher_target)
-                                    jpcr_count += 1
+                            # Always compute JPCR loss when teacher targets exist.
+                            # jpcr_weight=0 before distill → no gradient impact.
+                            # No branch on len(intermediates) to avoid torch.compile retrace.
+                            target_idx = i - self.intra_loop_start
+                            if target_idx < len(jpcr_teacher_intermediates):
+                                teacher_target = jpcr_teacher_intermediates[target_idx]
+                                jpcr_loss = jpcr_loss + predictor.compute_loss(predicted_target, teacher_target)
+                                jpcr_count += 1
                             x = x + gate * (predicted_target - x)
                         elif len(self.intra_loop_controllers) > 0:
                             ctrl = self.intra_loop_controllers[i - self.intra_loop_start]
-                            out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                            out = _run_ctrl_safe(ctrl, x, self.intra_loop_steps, self._intra_model_dim)
                             scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
                             shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
                             x = x * (1.0 + scale.tanh()) + shift
@@ -2879,16 +2881,15 @@ class GPT(nn.Module):
                         if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
                             predictor = self.jpcr_predictors[j - self.intra_loop_start]
                             predicted_target, gate = predictor(x)
-                            if len(jpcr_teacher_intermediates) > 0 and jpcr_weight > 0.0:
-                                target_idx = j - self.intra_loop_start
-                                if target_idx < len(jpcr_teacher_intermediates):
-                                    teacher_target = jpcr_teacher_intermediates[target_idx]
-                                    jpcr_loss = jpcr_loss + predictor.compute_loss(predicted_target, teacher_target)
-                                    jpcr_count += 1
+                            target_idx = j - self.intra_loop_start
+                            if target_idx < len(jpcr_teacher_intermediates):
+                                teacher_target = jpcr_teacher_intermediates[target_idx]
+                                jpcr_loss = jpcr_loss + predictor.compute_loss(predicted_target, teacher_target)
+                                jpcr_count += 1
                             x = x + gate * (predicted_target - x)
                         elif len(self.intra_loop_controllers) > 0:
                             ctrl = self.intra_loop_controllers[j - self.intra_loop_start]
-                            out = ctrl(x.mean(dim=1)).view(x.shape[0], self.intra_loop_steps, 2, self._intra_model_dim)
+                            out = _run_ctrl_safe(ctrl, x, self.intra_loop_steps, self._intra_model_dim)
                             scale = out[:, s, 0, :].unsqueeze(1).to(dtype=x.dtype)
                             shift = out[:, s, 1, :].unsqueeze(1).to(dtype=x.dtype)
                             x = x * (1.0 + scale.tanh()) + shift
@@ -2971,14 +2972,10 @@ class GPT(nn.Module):
             total_loss = total_loss + float(distill_weight) * kl
 
         # JPCR (JEPA Predictive Coding Recurrence) loss: average MSE across all predictor outputs.
-        if jpcr_count > 0 and jpcr_weight > 0.0:
+        # Always add the term (no branch on jpcr_weight) to keep torch.compile graph constant.
+        # When jpcr_weight=0.0 (before distill), the multiplication zeros out the gradient.
+        if jpcr_count > 0:
             total_loss = total_loss + float(jpcr_weight) * (jpcr_loss / jpcr_count)
-        elif self.jpcr_enabled and len(self.jpcr_predictors) > 0:
-            # Dummy usage so DDP sees gradients for predictor params even when loop is inactive.
-            # Use direct indexing to avoid generator-based graph breaks in torch.compile.
-            dummy = self.jpcr_predictors[0].proj_out.weight.sum() + self.jpcr_predictors[0].proj_out.bias.sum()
-            if len(self.jpcr_predictors) > 1:
-                dummy = dummy + self.jpcr_predictors[1].proj_out.weight.sum() + self.jpcr_predictors[1].proj_out.bias.sum()
             total_loss = total_loss + 0.0 * dummy
 
         # MoE router Z-loss — only during training (loss_mask is None means no sliding-window eval mask).
@@ -3294,11 +3291,6 @@ def main() -> None:
         # Python int instance attrs (num_heads, head_dim) are captured as symbolic inputs
         # to a subgraph. With world_size=1 the optimisation is a no-op anyway.
         torch._dynamo.config.optimize_ddp = False
-    # Pre-warm rotary caches at full seq_len before torch.compile to stabilize graph identity.
-    with torch.no_grad(), torch.amp.autocast(device_type=device.type, dtype=torch.bfloat16):
-        _dummy = torch.zeros(1, args.train_seq_len, dtype=torch.long, device=device)
-        base_model(_dummy, _dummy)
-        del _dummy
     compiled_model = torch.compile(base_model, dynamic=True) if use_compile else base_model
     model: nn.Module
     if distributed:
@@ -3789,10 +3781,16 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, curr_seq_len, grad_accum_steps)
-            # Always pass consistent types to forward() to avoid torch.compile retracing
-            # when distillation activates. Use empty tensors / empty lists instead of None.
+            # Always pass consistent types AND shapes to forward() to avoid torch.compile
+            # retracing when distillation activates. Dummy tensors with correct shapes keep
+            # the graph structure constant; jpcr_weight=0 before distill → no gradient impact.
             teacher_logits: Tensor = torch.empty(0, device=device)
-            teacher_intermediates: list[Tensor] = []
+            # Pre-create dummy intermediates so the list length never changes (avoids retrace)
+            _n_jpcr = (base_model.intra_loop_end - base_model.intra_loop_start + 1) if base_model.jpcr_enabled else 0
+            teacher_intermediates: list[Tensor] = [
+                torch.zeros(x.size(0), curr_seq_len, args.model_dim, device=device, dtype=torch.bfloat16)
+                for _ in range(_n_jpcr)
+            ] if _n_jpcr > 0 else []
             token_weights: Tensor | None = None
             aux_targets: Tensor | None = None
             train_loss_mask = build_train_loss_mask(x.size(0), curr_seq_len)
