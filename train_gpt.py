@@ -2721,9 +2721,10 @@ class GPT(nn.Module):
         return self.final_norm(x)
 
     def _forward_hidden_with_intermediates(self, input_ids: Tensor) -> tuple[Tensor, list[Tensor]]:
-        """Forward pass that captures hidden states after each block's FINAL pass.
+        """Forward pass that captures hidden states after each block (NO loop, NO conditioning).
 
-        Used by the EMA teacher to provide JEPA targets for JPCR predictors.
+        Used by the EMA teacher to provide clean JEPA targets for JPCR predictors.
+        Runs each block exactly once — the teacher represents the "ideal" single-pass model.
         Returns (final_hidden_after_norm, list_of_per_block_hidden_states).
         """
         x = self.tok_emb(input_ids)
@@ -2737,22 +2738,14 @@ class GPT(nn.Module):
         else:
             skips: list[Tensor] = []
             for i in range(self.num_encoder_layers):
-                n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
-                for s in range(n_rep):
-                    if n_rep > 1:
-                        x = self._apply_loop_conditioning(x, i, s)
-                    x, _ = self.blocks[i](x, x0)
-                intermediates.append(x)  # capture after final pass of each block
+                x, _ = self.blocks[i](x, x0)
+                intermediates.append(x)
                 skips.append(x)
             for i in range(self.num_decoder_layers):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 j = self.num_encoder_layers + i
-                n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
-                for s in range(n_rep):
-                    if n_rep > 1:
-                        x = self._apply_loop_conditioning(x, j, s)
-                    x, _ = self.blocks[j](x, x0)
+                x, _ = self.blocks[j](x, x0)
                 intermediates.append(x)
         return self.final_norm(x), intermediates
 
