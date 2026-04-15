@@ -26,6 +26,9 @@ import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+# Increase dynamo cache limit to avoid recompilation fallback when training conditions change
+# (e.g., distillation activation, rotary cache identity changes). Default is 8, which is too low.
+torch._dynamo.config.cache_size_limit = 64
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -3290,6 +3293,12 @@ def main() -> None:
         # Python int instance attrs (num_heads, head_dim) are captured as symbolic inputs
         # to a subgraph. With world_size=1 the optimisation is a no-op anyway.
         torch._dynamo.config.optimize_ddp = False
+    # Pre-warm rotary caches at full seq_len before torch.compile to stabilize graph identity.
+    # Without this, _cos_cached gets rebuilt mid-training causing dynamo recompilations.
+    with torch.no_grad():
+        _dummy = torch.zeros(1, args.train_seq_len, dtype=torch.long, device=device)
+        base_model(_dummy, _dummy)
+        del _dummy
     compiled_model = torch.compile(base_model, dynamic=True) if use_compile else base_model
     model: nn.Module
     if distributed:
