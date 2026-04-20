@@ -1233,6 +1233,14 @@ INT4_PER_ROW_SCALE_DTYPE = torch.float16
 INT4_CLIP_PERCENTILE = float(os.environ.get("INT4_CLIP_PERCENTILE", 99.995))
 INT4_CLIP_Q = INT4_CLIP_PERCENTILE / 100.0
 INT4_GROUP_SIZE = int(os.environ.get("INT4_GROUP_SIZE", "128"))  # 0 = per-row (legacy)
+INT5_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
+    pattern
+    for pattern in os.environ.get(
+        "INT5_KEEP_FLOAT_FP32_NAME_PATTERNS",
+        ",".join(CONTROL_TENSOR_NAME_PATTERNS),
+    ).split(",")
+    if pattern
+)
 INT5_KEEP_FLOAT_MAX_NUMEL = int(os.environ.get("INT5_KEEP_FLOAT_MAX_NUMEL", 65_536))
 INT5_PER_ROW_SCALE_DTYPE = torch.float16
 INT5_CLIP_PERCENTILE = float(os.environ.get("INT5_CLIP_PERCENTILE", 99.997))
@@ -1465,12 +1473,20 @@ def quantize_state_dict(
     keep_patterns = (
         MIXED_KEEP_FLOAT_NAME_PATTERNS
         if scheme == "mixed"
-        else (INT8_KEEP_FLOAT_FP32_NAME_PATTERNS if active_scheme == "int8" else INT4_KEEP_FLOAT_FP32_NAME_PATTERNS)
+        else (
+            INT8_KEEP_FLOAT_FP32_NAME_PATTERNS
+            if active_scheme == "int8"
+            else (INT5_KEEP_FLOAT_FP32_NAME_PATTERNS if active_scheme == "int5" else INT4_KEEP_FLOAT_FP32_NAME_PATTERNS)
+        )
     )
     force_fp32_patterns = (
         MIXED_KEEP_FLOAT_FP32_NAME_PATTERNS
         if scheme == "mixed"
-        else (INT8_KEEP_FLOAT_FP32_NAME_PATTERNS if active_scheme == "int8" else INT4_KEEP_FLOAT_FP32_NAME_PATTERNS)
+        else (
+            INT8_KEEP_FLOAT_FP32_NAME_PATTERNS
+            if active_scheme == "int8"
+            else (INT5_KEEP_FLOAT_FP32_NAME_PATTERNS if active_scheme == "int5" else INT4_KEEP_FLOAT_FP32_NAME_PATTERNS)
+        )
     )
     keep_max_numel = (
         MIXED_KEEP_FLOAT_MAX_NUMEL
@@ -3310,9 +3326,9 @@ def main() -> None:
         raise ValueError(f"Unsupported COMPRESSOR={args.compressor!r}; expected one of {sorted(SUPPORTED_COMPRESSORS)}")
     if args.weight_order not in SUPPORTED_WEIGHT_ORDERS:
         raise ValueError(f"Unsupported WEIGHT_ORDER={args.weight_order!r}; expected one of {sorted(SUPPORTED_WEIGHT_ORDERS)}")
-    if args.mixed_low_precision_scheme not in {"int8", "int4"}:
+    if args.mixed_low_precision_scheme not in {"int8", "int5", "int4"}:
         raise ValueError(
-            f"Unsupported MIXED_LOW_PRECISION_SCHEME={args.mixed_low_precision_scheme!r}; expected 'int8' or 'int4'"
+            f"Unsupported MIXED_LOW_PRECISION_SCHEME={args.mixed_low_precision_scheme!r}; expected 'int8', 'int5', or 'int4'"
         )
     sweep_specs = resolve_eval_sweep_specs(args)
     blend_specs, blend_weights = resolve_eval_blend_specs(args)

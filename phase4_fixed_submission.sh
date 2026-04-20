@@ -157,13 +157,13 @@ export MOE_CAPACITY_FACTOR="${MOE_CAPACITY_FACTOR:-1.0}"
 export MOE_AUX_LOSS_COEFF="${MOE_AUX_LOSS_COEFF:-1e-3}"
 
 # Quantization-Aware Training (QAT): fake-quantise weights late in training.
-# QAT_SCHEME: "none" | "int8" | "int4"  — should match QUANT_SCHEME at export.
+# QAT_SCHEME: "none" | "int8" | "int5" | "int4"  — should match QUANT_SCHEME at export.
 # QAT_START_STEP: delay QAT until ~65-75% of expected total steps.
-#   int4 uses a 3-stage progressive schedule (256→64→16 levels) to avoid spikes.
+#   int5 uses progressive 256→64→32 levels; int4 uses 256→64→16.
 export QAT_SCHEME="${QAT_SCHEME:-none}"
 export QAT_START_STEP="${QAT_START_STEP:-9000}"
 # QAT_LSQ=1 enables Learned Step-Size Quantization: per-row learnable
-# log-scale trained through STE during QAT, then exported as the int4/int8
+# log-scale trained through STE during QAT, then exported as the int4/int5/int8
 # packing scale (no extra eval-time cost). Targets ~0.025 quant penalty
 # vs ~0.054 for baseline progressive QAT.
 export QAT_LSQ="${QAT_LSQ:-0}"
