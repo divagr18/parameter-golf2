@@ -3841,11 +3841,20 @@ def main() -> None:
                     torch.zeros(x.size(0), args.train_seq_len, args.model_dim, device=device, dtype=torch.bfloat16)
                     for _ in range(_warmup_n_jpcr)
                 ] if _warmup_n_jpcr > 0 else []
+                # Dummy per_token_weights / aux_targets so warmup traces the same graph
+                # as the main loop (some configs pass non-None here — traced branches
+                # differ, so include them unconditionally to avoid retracing on step 1).
+                _wu_token_weights = torch.ones_like(y, dtype=torch.float32) if args.byte_weighted_loss_enabled else None
+                _wu_aux_targets = torch.zeros_like(y, dtype=torch.long) if args.dual_head_enabled else None
+                _wu_aux_weight = 0.0
                 if autocast_enabled:
                     with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                         warmup_loss = model(
                             x, y,
                             loss_mask=warmup_loss_mask,
+                            per_token_weights=_wu_token_weights,
+                            aux_targets=_wu_aux_targets,
+                            aux_weight=_wu_aux_weight,
                             distill_teacher_logits=_wu_teacher_logits,
                             distill_weight=0.0,
                             distill_temp=args.distill_temp,
@@ -3857,6 +3866,9 @@ def main() -> None:
                     warmup_loss = model(
                         x, y,
                         loss_mask=warmup_loss_mask,
+                        per_token_weights=_wu_token_weights,
+                        aux_targets=_wu_aux_targets,
+                        aux_weight=_wu_aux_weight,
                         distill_teacher_logits=_wu_teacher_logits,
                         distill_weight=0.0,
                         distill_temp=args.distill_temp,
