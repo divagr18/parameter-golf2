@@ -29,6 +29,37 @@ import torch.nn.functional as F
 # Increase dynamo cache limit to avoid recompilation fallback when training conditions change
 # (e.g., distillation activation, rotary cache identity changes). Default is 8, which is too low.
 torch._dynamo.config.cache_size_limit = 64
+# Workaround for torch 2.10.0 inductor bug in joint_graph `mul_softmax_pattern` that crashes
+# with "Tried to erase Node mul_N but it still had 1 users" during mid-training recompiles.
+# Falling back to eager for the subgraph that hits the buggy pattern is preferable to dying.
+torch._dynamo.config.suppress_errors = True
+try:
+    import torch._inductor.config as _inductor_config
+    # Disable the specific joint-graph pass that contains the faulty pattern matcher.
+    # Other fusions (conv/bn, pad, split-cat, etc.) remain enabled.
+    if hasattr(_inductor_config, "joint_graph_constant_folding"):
+        # Leaving constant folding on; the bug is in pattern rewrite, not const folding.
+        pass
+    # Try to drop just `mul_softmax_pattern` from the joint-graph patterns registry if present.
+    try:
+        from torch._inductor.fx_passes import joint_graph as _joint_graph
+        _patterns = getattr(_joint_graph, "patterns", None)
+        if _patterns is not None and hasattr(_patterns, "patterns"):
+            _filtered = []
+            for _p in list(_patterns.patterns):
+                _name = getattr(_p, "name", "") or repr(_p)
+                if "mul_softmax_pattern" in _name:
+                    continue
+                _filtered.append(_p)
+            # Only reassign if the registry exposes a mutable list; otherwise rely on suppress_errors.
+            try:
+                _patterns.patterns[:] = _filtered
+            except Exception:
+                pass
+    except Exception:
+        pass
+except Exception:
+    pass
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
