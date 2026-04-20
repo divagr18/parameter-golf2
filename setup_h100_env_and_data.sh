@@ -28,6 +28,13 @@ FINEWEB_VARIANT="${FINEWEB_VARIANT:-sp1024}"
 TRAIN_SHARDS="${TRAIN_SHARDS:-80}"
 INSTALL_DATA="${INSTALL_DATA:-1}"
 
+# Place the uv cache on the persistent /workspace volume (same filesystem as the venv)
+# so uv can hardlink wheels instead of byte-copying them. Avoids multi-minute stalls on
+# the torch wheel (~7 GB of files). Override UV_CACHE_DIR to pin elsewhere.
+UV_CACHE_DIR="${UV_CACHE_DIR:-/workspace/.uv_cache}"
+export UV_CACHE_DIR
+mkdir -p "${UV_CACHE_DIR}"
+
 # Helpers
 log()  { echo "[$(date '+%H:%M:%S')] $*"; }
 step() { echo; echo "=== $* ==="; }
@@ -89,16 +96,23 @@ elapsed
 # -------------------------------------------------------------------
 step "3/4  Python packages  (requirements.txt + zstandard)"
 # -------------------------------------------------------------------
-log "installing requirements.txt with uv ..."
-uv pip install --link-mode=copy -U -r requirements.txt
+# --link-mode defaults to hardlink when cache and venv share a filesystem (see UV_CACHE_DIR
+# setup at the top). If you need to override (e.g., a split-fs setup), pass UV_LINK_MODE=copy.
+UV_LINK_MODE_FLAG=()
+if [[ -n "${UV_LINK_MODE:-}" ]]; then
+  UV_LINK_MODE_FLAG=(--link-mode="${UV_LINK_MODE}")
+fi
+
+log "installing requirements.txt with uv (cache=${UV_CACHE_DIR}) ..."
+uv pip install "${UV_LINK_MODE_FLAG[@]}" -U -r requirements.txt
 elapsed
 
 # zstandard: try pre-built binary first (no C compilation = no hangs).
 # Fall back to source build only if no wheel is available.
 log "installing zstandard (binary wheel preferred) ..."
-if uv pip install --link-mode=copy "zstandard>=0.22" --no-build 2>/dev/null; then
+if uv pip install "${UV_LINK_MODE_FLAG[@]}" "zstandard>=0.22" --no-build 2>/dev/null; then
   log "zstandard installed from pre-built wheel"
-elif uv pip install --link-mode=copy "zstandard>=0.22" 2>/dev/null; then
+elif uv pip install "${UV_LINK_MODE_FLAG[@]}" "zstandard>=0.22" 2>/dev/null; then
   log "zstandard installed (compiled from source)"
 else
   log "WARNING: uv failed for zstandard, falling back to pip ..."
@@ -107,9 +121,9 @@ fi
 elapsed
 
 if [[ "${FORCE_CUDA_TORCH}" == "1" ]]; then
-  log "installing CUDA torch==${TORCH_VERSION} from ${TORCH_INDEX_URL} with uv ..."
-  log "(this downloads ~2-3 GB — uv will cache and install rapidly)"
-  uv pip install --link-mode=copy -U "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}"
+  log "installing CUDA torch==${TORCH_VERSION} from ${TORCH_INDEX_URL} with pip ..."
+  log "(uv hangs on the torch wheel install in some RunPod setups; pip handles it reliably)"
+  pip install --no-cache-dir --progress-bar on -U "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}"
   elapsed
 fi
 

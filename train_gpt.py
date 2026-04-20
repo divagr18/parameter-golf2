@@ -245,6 +245,23 @@ class Hyperparameters:
     moe_aux_loss_coeff = float(os.environ.get("MOE_AUX_LOSS_COEFF", "1e-3"))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    # Decoupled softcap for the ngram residual branch (0 = inherit LOGIT_SOFTCAP).
+    # Letting the ngram branch push harder than the neural head often helps when the
+    # residual ngram is well-trained (small but sharp tables).
+    ngram_softcap = float(os.environ.get("NGRAM_SOFTCAP", "0.0"))
+    # Entropy-conditioned ngram gate: gate also sees a confidence signal (lse - max logit,
+    # a cheap proxy for -log max_prob of the neural head) so ngram can dominate when the
+    # neural model is unsure. Adds one scalar input per gate.
+    ngram_entropy_gate = bool(int(os.environ.get("NGRAM_ENTROPY_GATE", "0")))
+    # Test-time training (competition-compliant): after scoring each eval batch, take one
+    # SGD step on the scored positions' CE loss. Only ngram/gate/scale params update; the
+    # base transformer is frozen. Params are snapshotted before eval and restored after,
+    # so intermediate val checkpoints are unaffected.  Only activated in the final eval
+    # suite.  Default off so existing runs are bit-identical.
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_lr = float(os.environ.get("TTT_LR", "1e-3"))
+    ttt_steps = int(os.environ.get("TTT_STEPS", "1"))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", "0.9"))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -737,6 +754,10 @@ def eval_val_single(
     seq_len: int,
     rope_scale: float,
     stride_frac: float,
+    ttt_enabled: bool = False,
+    ttt_lr: float = 0.0,
+    ttt_steps: int = 1,
+    ttt_momentum: float = 0.9,
 ) -> tuple[float, float]:
     _, prefix_len, stride = build_loss_mask_cpu(seq_len, stride_frac)
     if args.eval_cont_cache_enabled and world_size != 1:
@@ -754,9 +775,50 @@ def eval_val_single(
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
+    # --- TTT setup (competition-compliant online update) -----------------------------
+    # We snapshot the chosen param subset before eval starts, do SGD steps after each
+    # scored batch, then restore the snapshot before returning. This keeps the stored
+    # model state untouched so subsequent eval passes / quantization see clean weights.
+    ttt_active = bool(ttt_enabled) and float(ttt_lr) > 0.0
+    ttt_params: list[tuple[str, nn.Parameter]] = []
+    ttt_snapshots: list[Tensor] = []
+    ttt_prev_requires_grad: dict[int, bool] = {}
+    ttt_optim: torch.optim.Optimizer | None = None
+    raw_model = get_eval_model(model) if ttt_active else None
+    if ttt_active and raw_model is not None:
+        # Scope: ngram + pointer-gate + small learned scales. Base transformer stays frozen.
+        ttt_name_match = (
+            "residual_bigram_",
+            "residual_trigram_",
+            "residual_ngram_",
+            "bigram_left",
+            "bigram_right",
+            "bigram_scale",
+            "copy_gate",
+        )
+        for name, p in raw_model.named_parameters():
+            leaf = name.rsplit(".", 1)[-1]
+            if any(name.startswith(pref) or leaf.startswith(pref) for pref in ttt_name_match):
+                ttt_params.append((name, p))
+        ttt_prev_requires_grad = {id(p): p.requires_grad for p in raw_model.parameters()}
+        for p in raw_model.parameters():
+            p.requires_grad_(False)
+        for _, p in ttt_params:
+            p.requires_grad_(True)
+            ttt_snapshots.append(p.detach().clone())
+        if ttt_params:
+            ttt_optim = torch.optim.SGD(
+                [p for _, p in ttt_params], lr=float(ttt_lr), momentum=float(ttt_momentum)
+            )
+        else:
+            ttt_active = False  # nothing to update
+    # ---------------------------------------------------------------------------------
+
     model.eval()
     cache_state: tuple[Tensor, Tensor] | None = None
-    with torch.inference_mode():
+
+    eval_ctx = torch.enable_grad() if ttt_active else torch.inference_mode()
+    with eval_ctx:
         for batch_win_start in range(win_start, win_end, local_batch_seqs):
             batch_win_end = min(batch_win_start + local_batch_seqs, win_end)
             xs, ys = [], []
@@ -778,8 +840,11 @@ def eval_val_single(
                 cache_state,
             )
             target_log_probs = scored_log_probs.gather(-1, scored_targets.unsqueeze(-1)).squeeze(-1)
-            val_loss_sum += (-target_log_probs).sum(dtype=torch.float64)
-            val_token_count += target_log_probs.numel()
+
+            # Accumulate BPB stats (always detached from the TTT graph).
+            tlp_detached = target_log_probs.detach()
+            val_loss_sum += (-tlp_detached).sum(dtype=torch.float64)
+            val_token_count += tlp_detached.numel()
 
             prev_ids = x[:, prefix_len:].reshape(-1)
             tgt_ids = scored_targets.reshape(-1)
@@ -787,10 +852,37 @@ def eval_val_single(
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
 
+            # TTT update: CE on the scored suffix. This is competition-compliant because
+            # the update happens AFTER emitting the BPB for this batch, and only uses
+            # tokens whose predictions are already recorded (online learning).
+            if ttt_active and ttt_optim is not None:
+                ttt_loss = -target_log_probs.mean()
+                ttt_loss.backward()
+                ttt_optim.step()
+                ttt_optim.zero_grad(set_to_none=True)
+                for _ in range(max(0, int(ttt_steps) - 1)):
+                    # Additional steps re-run forward on the same batch. Kept behind
+                    # an explicit env knob; default TTT_STEPS=1 skips this branch.
+                    log_probs2, _h2 = forward_eval_outputs(args, model, x, seq_len, rope_scale, autocast_enabled)
+                    slp2 = log_probs2[:, prefix_len:, :]
+                    tlp2 = slp2.gather(-1, scored_targets.unsqueeze(-1)).squeeze(-1)
+                    (-tlp2.mean()).backward()
+                    ttt_optim.step()
+                    ttt_optim.zero_grad(set_to_none=True)
+
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    # Restore TTT param snapshots and prior requires_grad flags so the underlying
+    # model is bitwise unchanged after this function returns.
+    if ttt_active and raw_model is not None:
+        with torch.no_grad():
+            for (_, p), snap in zip(ttt_params, ttt_snapshots):
+                p.data.copy_(snap)
+        for p in raw_model.parameters():
+            p.requires_grad_(ttt_prev_requires_grad.get(id(p), False))
 
     val_loss = val_loss_sum / val_token_count
     bits_per_token = val_loss.item() / math.log(2.0)
@@ -980,10 +1072,15 @@ def run_final_eval_suite(
         primary_seq_len,
         primary_rope_scale,
         args.eval_stride_frac,
+        ttt_enabled=args.ttt_enabled,
+        ttt_lr=args.ttt_lr,
+        ttt_steps=args.ttt_steps,
+        ttt_momentum=args.ttt_momentum,
     )
     log0(
         f"{roundtrip_tag}_ctx_exact name:{primary_name} seq_len:{primary_seq_len} "
         f"rope_scale:{primary_rope_scale:.4f} stride_frac:{args.eval_stride_frac:.4f} "
+        f"ttt:{1 if args.ttt_enabled else 0} ttt_lr:{args.ttt_lr} ttt_steps:{args.ttt_steps} "
         f"val_loss:{primary_val_loss:.8f} val_bpb:{primary_val_bpb:.8f}"
     )
 
@@ -2490,6 +2587,8 @@ class GPT(nn.Module):
         residual_bigram_rank: int = 0,
         residual_trigram_rank: int = 0,
         residual_ngram_mix_init: float = -2.5,
+        ngram_softcap: float = 0.0,
+        ngram_entropy_gate: bool = False,
         copy_cache_enabled: bool = False,
         copy_cache_window: int = 256,
         copy_cache_dim: int = 64,
@@ -2546,6 +2645,9 @@ class GPT(nn.Module):
             self.residual_bigram_rank > 0 or self.residual_trigram_rank > 0
         )
         self.residual_ngram_mix_init = residual_ngram_mix_init
+        # 0.0 means "inherit logit_softcap"; >0 decouples the ngram branch cap.
+        self.ngram_softcap = float(ngram_softcap) if ngram_softcap > 0.0 else 0.0
+        self.ngram_entropy_gate = bool(ngram_entropy_gate) and self.residual_ngram_enabled
         self.copy_cache_enabled = copy_cache_enabled
         self.copy_cache_window = max(1, int(copy_cache_window))
         self.copy_cache_dim = max(8, int(copy_cache_dim))
@@ -2713,7 +2815,8 @@ class GPT(nn.Module):
                 self.residual_trigram_right = CastedLinear(self.residual_trigram_rank, vocab_size, bias=False)
                 self.residual_trigram_right._zero_init = True
             self.residual_ngram_scale = nn.Parameter(torch.ones(1, dtype=torch.float32))
-            self.residual_ngram_gate = CastedLinear(model_dim, 1, bias=True)
+            gate_in_dim = model_dim + (1 if self.ngram_entropy_gate else 0)
+            self.residual_ngram_gate = CastedLinear(gate_in_dim, 1, bias=True)
         if self.copy_cache_enabled:
             self.copy_q = CastedLinear(model_dim, self.copy_cache_dim, bias=False)
             self.copy_k = CastedLinear(model_dim, self.copy_cache_dim, bias=False)
@@ -2791,8 +2894,21 @@ class GPT(nn.Module):
         composed = neural_logits
         if ngram_logits is not None:
             # Stable residual composition in logit space.
-            gate = torch.sigmoid(self.residual_ngram_gate(hidden.reshape(-1, hidden.size(-1))))
-            ngram_logits = self.logit_softcap * torch.tanh(ngram_logits / self.logit_softcap)
+            flat_h = hidden.reshape(-1, hidden.size(-1))
+            if self.ngram_entropy_gate:
+                # Cheap confidence signal: (logsumexp - max) = -log max_prob. Larger = less confident.
+                # Detached so the gate signal is stop-grad wrt the neural head (keeps semantics simple).
+                with torch.no_grad():
+                    n_logits_f = neural_logits.float()
+                    lse = torch.logsumexp(n_logits_f, dim=-1, keepdim=True)
+                    max_logit = n_logits_f.max(dim=-1, keepdim=True).values
+                    neg_max_log_prob = (lse - max_logit).to(dtype=flat_h.dtype)
+                gate_input = torch.cat([flat_h, neg_max_log_prob], dim=-1)
+                gate = torch.sigmoid(self.residual_ngram_gate(gate_input))
+            else:
+                gate = torch.sigmoid(self.residual_ngram_gate(flat_h))
+            cap = self.ngram_softcap if self.ngram_softcap > 0.0 else self.logit_softcap
+            ngram_logits = cap * torch.tanh(ngram_logits / cap)
             composed = composed + gate.to(dtype=composed.dtype) * ngram_logits.to(dtype=composed.dtype)
 
         if not self.copy_cache_enabled:
@@ -2904,11 +3020,16 @@ class GPT(nn.Module):
         return h, logits, logits_are_log_probs
 
     def forward_logits(self, input_ids: Tensor) -> Tensor:
+        """Forward pass returning logits. NOTE: when self.copy_cache_enabled is True,
+        the returned tensor is log-probabilities (already log_softmax'd), not raw logits.
+        Callers that feed this into distillation must rely on student's logits_are_log_probs
+        flag to interpret format consistently (student and teacher share config)."""
         _, logits, _ = self.forward_hidden_and_output(input_ids)
         return logits
 
     def forward_logits_and_intermediates(self, input_ids: Tensor) -> tuple[Tensor, list[Tensor]]:
-        """Forward pass returning logits AND per-block hidden states for JPCR teacher."""
+        """Forward pass returning logits AND per-block hidden states for JPCR teacher.
+        Same format caveat as forward_logits: log-probs when copy_cache is enabled."""
         h, intermediates = self._forward_hidden_with_intermediates(input_ids)
         flat_h = h.reshape(-1, h.size(-1))
         if self.tie_embeddings:
@@ -3067,8 +3188,11 @@ class GPT(nn.Module):
         if distill_teacher_logits is not None and distill_teacher_logits.numel() > 0 and distill_weight > 0.0:
             temp = max(float(distill_temp), 1e-4)
             if logits_are_log_probs:
+                # Both student and teacher share config (EMA teacher). When copy_cache is
+                # enabled, both emit log-probs, so teacher must be exp()'d to probs.
+                # Temperature scaling is skipped (would need renormalization in prob space).
                 student_log_probs = logits.float()
-                teacher_probs = F.softmax(distill_teacher_logits.float(), dim=-1)
+                teacher_probs = distill_teacher_logits.float().exp()
             else:
                 student = (logits.float() / temp)
                 teacher = (distill_teacher_logits.float() / temp)
@@ -3379,6 +3503,8 @@ def main() -> None:
         residual_bigram_rank=args.residual_bigram_rank,
         residual_trigram_rank=args.residual_trigram_rank,
         residual_ngram_mix_init=args.residual_ngram_mix_init,
+        ngram_softcap=args.ngram_softcap,
+        ngram_entropy_gate=args.ngram_entropy_gate,
         copy_cache_enabled=args.copy_cache_enabled,
         copy_cache_window=args.copy_cache_window,
         copy_cache_dim=args.copy_cache_dim,
@@ -3609,6 +3735,8 @@ def main() -> None:
         f"residual_ngram_enabled:{args.residual_ngram_enabled} residual_bigram_rank:{args.residual_bigram_rank} "
         f"residual_trigram_rank:{args.residual_trigram_rank} residual_ngram_lr:{args.residual_ngram_lr} "
         f"residual_ngram_mix_init:{args.residual_ngram_mix_init} "
+        f"ngram_softcap:{args.ngram_softcap} ngram_entropy_gate:{args.ngram_entropy_gate} "
+        f"ttt_enabled:{args.ttt_enabled} ttt_lr:{args.ttt_lr} ttt_steps:{args.ttt_steps} ttt_momentum:{args.ttt_momentum} "
         f"copy_cache_enabled:{args.copy_cache_enabled} copy_cache_window:{args.copy_cache_window} "
         f"copy_cache_dim:{args.copy_cache_dim} copy_cache_lr:{args.copy_cache_lr} "
         f"copy_cache_gate_init:{args.copy_cache_gate_init} "
