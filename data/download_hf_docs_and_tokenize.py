@@ -85,6 +85,10 @@ def maybe_load_docs_sidecar_meta(docs_jsonl: Path) -> dict[str, Any] | None:
 
 
 def copy_from_hf_cache(*, repo_id: str, remote_root: str, filename: str, destination: Path) -> bool:
+    # If the file already exists locally, skip the HF download entirely.
+    if destination.exists():
+        return True
+
     remote_path = Path(remote_root) / filename if remote_root else Path(filename)
     try:
         cached_path = Path(
