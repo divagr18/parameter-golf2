@@ -31,13 +31,16 @@ if ! command -v torchrun >/dev/null 2>&1; then
   echo "torchrun not found. Run: bash ./setup_h100_env_and_data.sh" >&2
   exit 1
 fi
+export VOCAB_SIZE="${VOCAB_SIZE:-1024}"
+export DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp${VOCAB_SIZE}}"
+export TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_${VOCAB_SIZE}_bpe.model}"
 
-if [[ ! -f "./data/tokenizers/fineweb_1024_bpe.model" ]]; then
-  echo "Tokenizer missing at ./data/tokenizers/fineweb_1024_bpe.model" >&2
+if [[ ! -f "${TOKENIZER_PATH}" ]]; then
+  echo "Tokenizer missing at ${TOKENIZER_PATH}" >&2
   exit 1
 fi
-if [[ ! -d "./data/datasets/fineweb10B_sp1024" ]]; then
-  echo "Dataset missing at ./data/datasets/fineweb10B_sp1024" >&2
+if [[ ! -d "${DATA_PATH}" ]]; then
+  echo "Dataset missing at ${DATA_PATH}" >&2
   exit 1
 fi
 
@@ -91,10 +94,7 @@ export USE_TORCH_COMPILE="${USE_TORCH_COMPILE:-1}"          # FIX: was 0
 export SDP_BACKEND_MODE="${SDP_BACKEND_MODE:-flash}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-# Data
-export DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp1024}"
-export TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_1024_bpe.model}"
-export VOCAB_SIZE="${VOCAB_SIZE:-1024}"
+# Data (paths already exported above for initial validation)
 
 # -----------------------------------------------------------------
 # BUG FIX 1: wallclock = 600 (10 minutes), not 360 (6 minutes)
