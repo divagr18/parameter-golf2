@@ -20,7 +20,7 @@
         "num_sub_iterations": 4,
         "max_sentencepiece_length": 32,
         "shuffle_input_sentence": true,
-        "input_sentence_size": 10000000
+        "input_sentence_size": 1000000
       }
     }
   ]
