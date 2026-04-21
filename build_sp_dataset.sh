@@ -58,25 +58,50 @@ fi
 # -------------------------------------------------------------------
 step "2/3  Build temporary tokenizer spec"
 # -------------------------------------------------------------------
-# We write a minimal spec containing ONLY the requested vocab size.
-# Any existing SP models are passed via --reuse-sp-model so they do
-# not need to be retrained (saves several minutes per model).
+# We write a spec containing the requested vocab size with improved
+# training settings:
+#   - model_type=unigram  : probabilistic, lower-entropy segmentations
+#   - split_by_whitespace=false : allows cross-word merges (" of the" etc.)
+#   - num_sub_iterations=4 : more EM passes → better vocab selection
+#   - max_sentencepiece_length=32 : capture longer common tokens
+#   - nfkc normalization : less aggressive than nmt_nfkc, preserves more
+#   - input_sentence_size=10M + shuffle : better frequency estimates
+#   - byte_fallback=false + coverage=0.99999 : reclaim 256 slots for merges
+#
+# Any *other* existing SP models are passed via --reuse-sp-model so they
+# are not needlessly retrained. The target VOCAB_SIZE is always retrained
+# so stale BPE models are never reused with the wrong model_type.
 
 SPEC_FILE="$(mktemp /tmp/sp_spec_XXXXXX.json)"
 cat > "${SPEC_FILE}" <<JSON
 {
   "tokenizers": [
     {
-      "name": "sp_bpe_${VOCAB_SIZE}",
+      "name": "sp_unigram_${VOCAB_SIZE}",
       "dataset_suffix": "sp${VOCAB_SIZE}",
-      "vocab_size": ${VOCAB_SIZE}
+      "vocab_size": ${VOCAB_SIZE},
+      "trainer_overrides": {
+        "model_type": "unigram",
+        "character_coverage": 0.99999,
+        "byte_fallback": false,
+        "split_digits": true,
+        "split_by_whitespace": false,
+        "normalization_rule_name": "nfkc",
+        "add_dummy_prefix": false,
+        "num_sub_iterations": 4,
+        "max_sentencepiece_length": 32,
+        "shuffle_input_sentence": true,
+        "input_sentence_size": 10000000
+      }
     }
   ]
 }
 JSON
 log "tokenizer spec written to ${SPEC_FILE}"
 
-# Auto-detect any existing SentencePiece models to reuse
+# Auto-detect any existing SentencePiece models to reuse.
+# Skip the target VOCAB_SIZE — always retrain it so stale BPE models
+# are never silently reused with the wrong model_type/settings.
 REUSE_ARGS=()
 for MODEL_FILE in "${OUTPUT_ROOT}"/tokenizers/fineweb_*_bpe.model; do
   [[ -f "${MODEL_FILE}" ]] || continue
@@ -87,9 +112,11 @@ m = re.search(r'fineweb_(\d+)_bpe\.model$', sys.argv[1])
 print(m.group(1) if m else "")
 PY
 )"
-  if [[ -n "${EXISTING_VS}" ]]; then
+  if [[ -n "${EXISTING_VS}" && "${EXISTING_VS}" != "${VOCAB_SIZE}" ]]; then
     log "reusing existing sp${EXISTING_VS} tokenizer: ${MODEL_FILE}"
     REUSE_ARGS+=(--reuse-sp-model "${EXISTING_VS}=${MODEL_FILE}")
+  elif [[ "${EXISTING_VS}" == "${VOCAB_SIZE}" ]]; then
+    log "found existing sp${EXISTING_VS} model but NOT reusing — will retrain with improved settings"
   fi
 done
 
@@ -128,10 +155,10 @@ log "Build complete in ${T_TOTAL}s"
 log "Dataset : ${OUTPUT_ROOT}/datasets/fineweb10B_sp${VOCAB_SIZE}/"
 log "Tokenizer: ${OUTPUT_ROOT}/tokenizers/fineweb_${VOCAB_SIZE}_bpe.model"
 log ""
-log "To train with this dataset:"
-log "  RUN_ID=my_sp${VOCAB_SIZE}_run \\"
-log "  DATA_PATH=${OUTPUT_ROOT}/datasets/fineweb10B_sp${VOCAB_SIZE}/ \\"
-log "  TOKENIZER_PATH=${OUTPUT_ROOT}/tokenizers/fineweb_${VOCAB_SIZE}_bpe.model \\"
-log "  VOCAB_SIZE=${VOCAB_SIZE} \\"
-log "  torchrun --standalone --nproc_per_node=8 train_gpt.py"
+log "To train with this dataset (phase4_fixed_submission.sh):"
+log "  env \\"
+log "    DATA_PATH=${OUTPUT_ROOT}/datasets/fineweb10B_sp${VOCAB_SIZE} \\"
+log "    TOKENIZER_PATH=${OUTPUT_ROOT}/tokenizers/fineweb_${VOCAB_SIZE}_bpe.model \\"
+log "    VOCAB_SIZE=${VOCAB_SIZE} \\"
+log "    bash ./phase4_fixed_submission.sh"
 log "=================================================="
