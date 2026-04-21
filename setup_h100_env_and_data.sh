@@ -111,7 +111,11 @@ if [[ -n "${UV_LINK_MODE:-}" ]]; then
 fi
 
 log "installing requirements.txt with uv (cache=${UV_CACHE_DIR}) ..."
-uv pip install "${UV_LINK_MODE_FLAG[@]}" -U -r requirements.txt
+if ! uv pip install "${UV_LINK_MODE_FLAG[@]}" -U -r requirements.txt; then
+  log "WARNING: uv failed to inspect the venv interpreter (likely a 'python' pkg conflict)."
+  log "Falling back to plain pip for requirements.txt ..."
+  pip install -U -r requirements.txt
+fi
 elapsed
 
 # zstandard: try pre-built binary first (no C compilation = no hangs).
