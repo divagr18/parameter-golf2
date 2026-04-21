@@ -256,18 +256,26 @@ def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tok
     model_path = prefix.with_suffix(".model")
     vocab_path = prefix.with_suffix(".vocab")
     prefix.parent.mkdir(parents=True, exist_ok=True)
+
+    # Resolve reuse path BEFORE the unlink loop so we don't delete our own source.
+    reuse_model_path_raw = spec.get("reuse_model_path")
+    reuse_model_path = (
+        Path(reuse_model_path_raw).expanduser().resolve()
+        if reuse_model_path_raw is not None
+        else None
+    )
+
     for artifact in (model_path, vocab_path):
-        if artifact.exists():
+        if artifact.exists() and (reuse_model_path is None or artifact.resolve() != reuse_model_path):
             artifact.unlink()
 
-    reuse_model_path = spec.get("reuse_model_path")
     if reuse_model_path is not None:
-        reuse_model_path = Path(reuse_model_path).expanduser().resolve()
         if not reuse_model_path.is_file():
             raise FileNotFoundError(reuse_model_path)
-        shutil.copy2(reuse_model_path, model_path)
+        if model_path.resolve() != reuse_model_path:
+            shutil.copy2(reuse_model_path, model_path)
         reuse_vocab_path = reuse_model_path.with_suffix(".vocab")
-        if reuse_vocab_path.is_file():
+        if reuse_vocab_path.is_file() and vocab_path.resolve() != reuse_vocab_path.resolve():
             shutil.copy2(reuse_vocab_path, vocab_path)
     else:
         kwargs = {
