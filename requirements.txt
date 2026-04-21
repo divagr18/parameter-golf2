@@ -1,6 +1,7 @@
 numpy
 tqdm
 huggingface-hub
+torch==2.10.0
 kernels
 setuptools
 typing-extensions==4.15.0

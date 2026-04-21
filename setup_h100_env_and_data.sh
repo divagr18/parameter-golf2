@@ -23,6 +23,13 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV_DIR="${VENV_DIR:-.venv}"
 FORCE_CUDA_TORCH="${FORCE_CUDA_TORCH:-1}"
 TORCH_VERSION="${TORCH_VERSION:-2.10.0}"
+# Derive matching torchvision/torchaudio versions from TORCH_VERSION.
+# Pattern: torch 2.X.Y -> torchvision 0.(X+15).Y, torchaudio 2.X.Y
+_TORCH_MINOR=$(echo "${TORCH_VERSION}" | cut -d. -f2)
+_TORCH_PATCH=$(echo "${TORCH_VERSION}" | cut -d. -f3)
+_VISION_MINOR=$(( _TORCH_MINOR + 15 ))
+VISION_VERSION="${VISION_VERSION:-0.${_VISION_MINOR}.${_TORCH_PATCH}}"
+AUDIO_VERSION="${AUDIO_VERSION:-${TORCH_VERSION}}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 FINEWEB_VARIANT="${FINEWEB_VARIANT:-sp1024}"
 TRAIN_SHARDS="${TRAIN_SHARDS:-80}"
@@ -43,7 +50,7 @@ elapsed() { echo "[$(date '+%H:%M:%S')] done (${SECONDS}s elapsed total)"; }
 T_START="${SECONDS}"
 log "setup_h100_env_and_data.sh starting"
 log "python_bin=${PYTHON_BIN}  venv=${VENV_DIR}  force_cuda_torch=${FORCE_CUDA_TORCH}"
-log "torch_version=${TORCH_VERSION}  index_url=${TORCH_INDEX_URL}"
+log "torch_version=${TORCH_VERSION}  vision_version=${VISION_VERSION}  audio_version=${AUDIO_VERSION}  index_url=${TORCH_INDEX_URL}"
 log "fineweb_variant=${FINEWEB_VARIANT}  train_shards=${TRAIN_SHARDS}  install_data=${INSTALL_DATA}"
 
 # -------------------------------------------------------------------
@@ -121,15 +128,21 @@ fi
 elapsed
 
 if [[ "${FORCE_CUDA_TORCH}" == "1" ]]; then
-  log "installing CUDA torch==${TORCH_VERSION} from ${TORCH_INDEX_URL} with pip ..."
+  log "installing CUDA torch==${TORCH_VERSION} + torchvision==${VISION_VERSION} + torchaudio==${AUDIO_VERSION} ..."
   log "(uv hangs on the torch wheel install in some RunPod setups; pip handles it reliably)"
-  pip install --no-cache-dir --progress-bar on -U "torch==${TORCH_VERSION}" --index-url "${TORCH_INDEX_URL}"
+  pip install --no-cache-dir --progress-bar on -U \
+    "torch==${TORCH_VERSION}" \
+    "torchvision==${VISION_VERSION}" \
+    "torchaudio==${AUDIO_VERSION}" \
+    --index-url "${TORCH_INDEX_URL}"
   elapsed
 fi
 
 log "verifying installed packages ..."
 python - <<'PY'
-import importlib.util, sys, time
+import importlib, importlib.util, sys
+# Invalidate stale caches so packages installed moments ago by pip are visible.
+importlib.invalidate_caches()
 
 mods = ["torch", "zstandard", "sentencepiece", "datasets", "huggingface_hub", "tqdm", "tiktoken"]
 missing = [m for m in mods if importlib.util.find_spec(m) is None]
