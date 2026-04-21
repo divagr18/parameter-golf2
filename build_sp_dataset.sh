@@ -23,6 +23,7 @@ cd "$(dirname "$0")"
 VOCAB_SIZE="${1:-${VOCAB_SIZE:-8192}}"
 VENV_DIR="${VENV_DIR:-.venv}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-./data}"
+MAX_TRAIN_SHARDS="${MAX_TRAIN_SHARDS:-80}"
 TOKENIZER_TRAIN_DOCS="${TOKENIZER_TRAIN_DOCS:-}"
 
 # Helpers
@@ -32,7 +33,7 @@ elapsed(){ echo "[$(date '+%H:%M:%S')] done (${SECONDS}s elapsed total)"; }
 
 T_START="${SECONDS}"
 log "build_sp_dataset.sh starting"
-log "vocab_size=${VOCAB_SIZE}  venv=${VENV_DIR}  output_root=${OUTPUT_ROOT}"
+log "vocab_size=${VOCAB_SIZE}  max_train_shards=${MAX_TRAIN_SHARDS}  venv=${VENV_DIR}  output_root=${OUTPUT_ROOT}"
 
 # -------------------------------------------------------------------
 step "1/3  Activate virtualenv"
@@ -112,6 +113,7 @@ python3 data/download_hf_docs_and_tokenize.py \
   --output-root   "${OUTPUT_ROOT}" \
   --tokenizer-config "${SPEC_FILE}" \
   --skip-byte \
+  --max-train-shards "${MAX_TRAIN_SHARDS}" \
   "${REUSE_ARGS[@]+"${REUSE_ARGS[@]}"}" \
   "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"
 

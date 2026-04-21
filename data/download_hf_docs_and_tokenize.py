@@ -314,6 +314,7 @@ def export_shards(
     num_val_docs: int,
     shard_size: int,
     docs_total: int,
+    max_train_shards: int | None = None,
 ) -> dict[str, int]:
     output_dir.mkdir(parents=True, exist_ok=True)
     for pattern in ("fineweb_train_*.bin", "fineweb_val_*.bin"):
@@ -335,6 +336,7 @@ def export_shards(
     fill = 0
     split = "val"
     shards = {"val": 0, "train": 0}
+    done = False
 
     def flush() -> None:
         nonlocal fill
@@ -353,6 +355,8 @@ def export_shards(
     batch_encode = tok.get("encode_batch")
     batch_size = SP_BATCH_SIZE if callable(batch_encode) else 1
     for texts in batched_docs_jsonl(docs_jsonl, batch_size):
+        if done:
+            break
         encoded_docs = batch_encode(texts) if callable(batch_encode) else [tok["encode"](text) for text in texts]
         for text, encoded in zip(texts, encoded_docs, strict=True):
             del text
@@ -385,12 +389,21 @@ def export_shards(
                 pos += take
                 if fill == shard_size:
                     flush()
+                    # Stop after flushing the Nth complete train shard
+                    if max_train_shards is not None and split == "train" and shards["train"] >= max_train_shards:
+                        done = True
+                        break
+            if done:
+                break
 
         if stats["docs_total"] and stats["docs_total"] % 100_000 == 0:
             print(f"{output_dir.name}: {stats['docs_total']}/{docs_total} docs", flush=True)
 
-    flush()
-    if stats["docs_total"] != docs_total:
+    if not done:
+        flush()
+    if done:
+        print(f"{output_dir.name}: stopped after {max_train_shards} train shards ({stats['docs_total']} docs processed)", flush=True)
+    elif stats["docs_total"] != docs_total:
         raise ValueError(f"expected {docs_total} docs, exported {stats['docs_total']}")
     return stats
 
@@ -496,6 +509,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--chunk-tokens", type=int, default=SHARD_SIZE, help="Shard size in tokens.")
     parser.add_argument(
+        "--max-train-shards",
+        type=int,
+        default=None,
+        help="Stop after this many complete training shards. Default: export all shards.",
+    )
+    parser.add_argument(
         "--tokenizer-train-docs",
         type=int,
         default=None,
@@ -599,6 +618,7 @@ def main() -> None:
             num_val_docs=num_val_docs,
             shard_size=int(args.chunk_tokens),
             docs_total=docs_total,
+            max_train_shards=args.max_train_shards,
         )
         manifest["tokenizers"].append(tok["manifest"])
         manifest["datasets"].append(
