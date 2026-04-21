@@ -87,7 +87,7 @@ m = re.search(r'fineweb_(\d+)_bpe\.model$', sys.argv[1])
 print(m.group(1) if m else "")
 PY
 )"
-  if [[ -n "${EXISTING_VS}" ]] && [[ "${EXISTING_VS}" != "${VOCAB_SIZE}" ]]; then
+  if [[ -n "${EXISTING_VS}" ]]; then
     log "reusing existing sp${EXISTING_VS} tokenizer: ${MODEL_FILE}"
     REUSE_ARGS+=(--reuse-sp-model "${EXISTING_VS}=${MODEL_FILE}")
   fi
