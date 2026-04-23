@@ -3601,7 +3601,9 @@ def main() -> None:
         # qat_log_scale params are registered but sit idle until QAT activates.
         # Dual-head params can also be intentionally inactive during warmup / before
         # DUAL_HEAD_START_FRAC, so include that condition as well.
-        _ddp_find_unused = bool(args.qat_lsq or args.dual_head_enabled)
+        # JPCR predictors also have projection heads that are only used once the
+        # JEPA/distill path is active, so treat them as potentially-unused too.
+        _ddp_find_unused = bool(args.qat_lsq or args.dual_head_enabled or args.jpcr_enabled)
         model = (
             DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=_ddp_find_unused)
             if device.type == "cuda"
