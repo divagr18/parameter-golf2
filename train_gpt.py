@@ -3119,6 +3119,7 @@ class GPT(nn.Module):
         logit_reg_weight: float = 0.0,
         jpcr_teacher_intermediates: list[Tensor] | None = (),
         jpcr_weight: float = 0.0,
+        jpcr_runtime_active: bool = False,
     ) -> Tensor:
         if jpcr_teacher_intermediates is None:
             jpcr_teacher_intermediates = ()
@@ -3137,10 +3138,11 @@ class GPT(nn.Module):
                     moe_z_loss = moe_z_loss + zl
         else:
             skips: list[Tensor] = []
-            # Always run the intra-loop to keep the torch.compile graph structure constant.
-            # Before distill, JPCR predictors are zero-init (identity blend), so the loop
-            # is a mild overhead but avoids a catastrophic dynamo recompilation stall.
-            loop_active = True
+            # JPCR loop conditioning is only enabled once distill/JEPA is active.
+            # This avoids paying the extra intra-loop compute on the entire pre-distill run.
+            # The graph may retrace once when JPCR turns on, but that is cheaper than
+            # carrying the extra loop overhead for hundreds of seconds.
+            loop_active = jpcr_runtime_active or len(self.intra_loop_controllers) > 0
             # First half stores skips; second half reuses them in reverse order.
             for i in range(self.num_encoder_layers):
                 n_rep = (self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1) if loop_active else 1
@@ -3924,6 +3926,7 @@ def main() -> None:
                             logit_reg_weight=0.0,
                             jpcr_teacher_intermediates=_wu_intermediates,
                             jpcr_weight=0.0,
+                            jpcr_runtime_active=False,
                         )
                 else:
                     warmup_loss = model(
@@ -3938,6 +3941,7 @@ def main() -> None:
                         logit_reg_weight=0.0,
                         jpcr_teacher_intermediates=_wu_intermediates,
                         jpcr_weight=0.0,
+                        jpcr_runtime_active=False,
                     )
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
@@ -4107,6 +4111,7 @@ def main() -> None:
             and args.distill_weight > 0.0
             and distill_is_active(args, step, elapsed_ms, max_wallclock_ms, distill_start_step)
         )
+        jpcr_runtime_active = bool(base_model.jpcr_enabled and distill_active)
         # JPCR loss warmup: ramp weight from 0 → full over jpcr_warmup_steps after distill activates.
         # Also freeze blend gates for first 300 steps so predictors learn via loss before affecting forward pass.
         if distill_active and base_model.jpcr_enabled:
@@ -4134,15 +4139,16 @@ def main() -> None:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, curr_seq_len, grad_accum_steps)
             # Always pass consistent types AND shapes to forward() to avoid torch.compile
-            # retracing when distillation activates. Dummy tensors with correct shapes keep
-            # the graph structure constant; jpcr_weight=0 before distill → no gradient impact.
+            # retracing when distillation activates. JPCR is only enabled once distill is on.
             teacher_logits: Tensor = torch.empty(0, device=device)
-            # Pre-create dummy intermediates so the list length never changes (avoids retrace)
-            _n_jpcr = (base_model.intra_loop_end - base_model.intra_loop_start + 1) if base_model.jpcr_enabled else 0
-            teacher_intermediates: list[Tensor] = [
-                torch.zeros(x.size(0), curr_seq_len, args.model_dim, device=device, dtype=torch.bfloat16)
-                for _ in range(_n_jpcr)
-            ] if _n_jpcr > 0 else []
+            if jpcr_runtime_active and args.jpcr_weight > 0.0:
+                _n_jpcr = (base_model.intra_loop_end - base_model.intra_loop_start + 1)
+                teacher_intermediates: list[Tensor] = [
+                    torch.zeros(x.size(0), curr_seq_len, args.model_dim, device=device, dtype=torch.bfloat16)
+                    for _ in range(_n_jpcr)
+                ]
+            else:
+                teacher_intermediates = []
             token_weights: Tensor | None = None
             aux_targets: Tensor | None = None
             train_loss_mask = build_train_loss_mask(x.size(0), curr_seq_len)
@@ -4151,7 +4157,7 @@ def main() -> None:
                 # downstream ops save them for backward (e.g., KL in distillation under compile).
                 # Wrap in autocast to match training dtype (bf16) — teacher weights are bf16.
                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
-                    if base_model.jpcr_enabled and args.jpcr_weight > 0.0:
+                    if jpcr_runtime_active and args.jpcr_weight > 0.0:
                         # Capture both logits and per-block intermediates for JPCR
                         teacher_logits, teacher_intermediates = ema_teacher.forward_logits_and_intermediates(x)
                         teacher_logits = teacher_logits.detach()
@@ -4196,6 +4202,7 @@ def main() -> None:
                         logit_reg_weight=args.logit_reg_weight,
                         jpcr_teacher_intermediates=teacher_intermediates,
                         jpcr_weight=jpcr_active_weight,
+                        jpcr_runtime_active=jpcr_runtime_active,
                     )
             else:
                 loss = model(
@@ -4211,6 +4218,7 @@ def main() -> None:
                     logit_reg_weight=args.logit_reg_weight,
                     jpcr_teacher_intermediates=teacher_intermediates,
                     jpcr_weight=jpcr_active_weight,
+                        jpcr_runtime_active=jpcr_runtime_active,
                 )
             train_loss += loss.detach()
             (loss * grad_scale).backward()
