@@ -3148,28 +3148,24 @@ class GPT(nn.Module):
                     moe_z_loss = moe_z_loss + zl
         else:
             skips: list[Tensor] = []
-            # JPCR loop conditioning is only enabled once distill/JEPA is active.
-            # This avoids paying the extra intra-loop compute on the entire pre-distill run.
-            # The graph may retrace once when JPCR turns on, but that is cheaper than
-            # carrying the extra loop overhead for hundreds of seconds.
-            loop_active = jpcr_runtime_active or len(self.intra_loop_controllers) > 0
             # First half stores skips; second half reuses them in reverse order.
             for i in range(self.num_encoder_layers):
-                n_rep = (self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1) if loop_active else 1
+                n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
                 for s in range(n_rep):
                     if n_rep > 1 and s > 0:
                         if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
-                            predictor = self.jpcr_predictors[i - self.intra_loop_start]
-                            predicted_target, gate = predictor(x)
-                            # Always compute JPCR loss when teacher targets exist.
-                            # jpcr_weight=0 before distill → no gradient impact.
-                            # No branch on len(intermediates) to avoid torch.compile retrace.
-                            target_idx = (i + s) - self.intra_loop_start
-                            if target_idx < len(jpcr_teacher_intermediates):
-                                teacher_target = jpcr_teacher_intermediates[target_idx]
-                                jpcr_loss = jpcr_loss + predictor.compute_loss(predicted_target, teacher_target)
-                                jpcr_count += 1
-                            x = x + gate * (predicted_target - x)
+                            if jpcr_runtime_active:
+                                predictor = self.jpcr_predictors[i - self.intra_loop_start]
+                                predicted_target, gate = predictor(x)
+                                # Always compute JPCR loss when teacher targets exist.
+                                # jpcr_weight=0 before distill → no gradient impact.
+                                # No branch on len(intermediates) to avoid torch.compile retrace.
+                                target_idx = (i + s) - self.intra_loop_start
+                                if target_idx < len(jpcr_teacher_intermediates):
+                                    teacher_target = jpcr_teacher_intermediates[target_idx]
+                                    jpcr_loss = jpcr_loss + predictor.compute_loss(predicted_target, teacher_target)
+                                    jpcr_count += 1
+                                x = x + gate * (predicted_target - x)
                         elif len(self.intra_loop_controllers) > 0:
                             ctrl = self.intra_loop_controllers[i - self.intra_loop_start]
                             out = _run_ctrl_safe(ctrl, x, self.intra_loop_steps, self._intra_model_dim)
@@ -3183,18 +3179,19 @@ class GPT(nn.Module):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 j = self.num_encoder_layers + i
-                n_rep = (self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1) if loop_active else 1
+                n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
                 for s in range(n_rep):
                     if n_rep > 1 and s > 0:
                         if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
-                            predictor = self.jpcr_predictors[j - self.intra_loop_start]
-                            predicted_target, gate = predictor(x)
-                            target_idx = (j + s) - self.intra_loop_start
-                            if target_idx < len(jpcr_teacher_intermediates):
-                                teacher_target = jpcr_teacher_intermediates[target_idx]
-                                jpcr_loss = jpcr_loss + predictor.compute_loss(predicted_target, teacher_target)
-                                jpcr_count += 1
-                            x = x + gate * (predicted_target - x)
+                            if jpcr_runtime_active:
+                                predictor = self.jpcr_predictors[j - self.intra_loop_start]
+                                predicted_target, gate = predictor(x)
+                                target_idx = (j + s) - self.intra_loop_start
+                                if target_idx < len(jpcr_teacher_intermediates):
+                                    teacher_target = jpcr_teacher_intermediates[target_idx]
+                                    jpcr_loss = jpcr_loss + predictor.compute_loss(predicted_target, teacher_target)
+                                    jpcr_count += 1
+                                x = x + gate * (predicted_target - x)
                         elif len(self.intra_loop_controllers) > 0:
                             ctrl = self.intra_loop_controllers[j - self.intra_loop_start]
                             out = _run_ctrl_safe(ctrl, x, self.intra_loop_steps, self._intra_model_dim)
@@ -4330,7 +4327,8 @@ def main() -> None:
     # GPTQ: Hessian-aware post-training quantization (replaces naive round-to-nearest).
     gptq_results: dict[str, tuple[Tensor, Tensor]] | None = None
     if args.gptq_enabled:
-        gptq_bits = 4 if args.quant_scheme in ("int4", "mixed") else (5 if args.quant_scheme == "int5" else 8)
+        active_scheme = args.mixed_low_precision_scheme if args.quant_scheme == "mixed" else args.quant_scheme
+        gptq_bits = 4 if active_scheme == "int4" else (5 if active_scheme == "int5" else 8)
         if master_process:
             log0(f"gptq: collecting Hessians from {args.gptq_nsamples} calibration samples...")
         CastedLinear.qat_levels = 0  # disable fake-quant for calibration
