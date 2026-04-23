@@ -1,0 +1,22 @@
+{
+  "tokenizers": [
+    {
+      "name": "sp_unigram_8192",
+      "dataset_suffix": "sp8192",
+      "vocab_size": 8192,
+      "trainer_overrides": {
+        "model_type": "unigram",
+        "character_coverage": 0.99999,
+        "byte_fallback": false,
+        "split_digits": true,
+        "split_by_whitespace": false,
+        "normalization_rule_name": "nfkc",
+        "add_dummy_prefix": false,
+        "num_sub_iterations": 4,
+        "max_sentencepiece_length": 32,
+        "shuffle_input_sentence": true,
+        "input_sentence_size": 1000000
+      }
+    }
+  ]
+}
