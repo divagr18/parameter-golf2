@@ -3275,7 +3275,7 @@ class GPT(nn.Module):
         # When jpcr_weight=0.0 (before distill), the multiplication zeros out the gradient.
         if jpcr_count > 0:
             total_loss = total_loss + float(jpcr_weight) * (jpcr_loss / jpcr_count)
-            total_loss = total_loss + 0.0 * dummy
+            total_loss = total_loss + 0.0 * jpcr_loss
 
         # MoE router Z-loss — only during training (loss_mask is None means no sliding-window eval mask).
         # Follows the same pattern as MTP (excluded during eval to keep val_bpb clean).

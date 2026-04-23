@@ -13,6 +13,7 @@ set -euo pipefail
 #   FORCE_CUDA_TORCH=1
 #   TORCH_VERSION=2.10.0
 #   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
+#   TOKENIZER_VOCAB_SIZE=8192   shorthand for FINEWEB_VARIANT=sp8192
 #   FINEWEB_VARIANT=sp1024
 #   TRAIN_SHARDS=80
 #   INSTALL_DATA=1
@@ -31,9 +32,17 @@ _VISION_MINOR=$(( _TORCH_MINOR + 15 ))
 VISION_VERSION="${VISION_VERSION:-0.${_VISION_MINOR}.${_TORCH_PATCH}}"
 AUDIO_VERSION="${AUDIO_VERSION:-${TORCH_VERSION}}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
+TOKENIZER_VOCAB_SIZE="${TOKENIZER_VOCAB_SIZE:-}"
 FINEWEB_VARIANT="${FINEWEB_VARIANT:-sp1024}"
 TRAIN_SHARDS="${TRAIN_SHARDS:-80}"
 INSTALL_DATA="${INSTALL_DATA:-1}"
+
+# Allow shorthand: TOKENIZER_VOCAB_SIZE=8192 or FINEWEB_VARIANT=8192
+if [[ -n "${TOKENIZER_VOCAB_SIZE}" ]]; then
+  FINEWEB_VARIANT="sp${TOKENIZER_VOCAB_SIZE}"
+elif [[ "${FINEWEB_VARIANT}" =~ ^[0-9]+$ ]]; then
+  FINEWEB_VARIANT="sp${FINEWEB_VARIANT}"
+fi
 
 # Place the uv cache on the persistent /workspace volume (same filesystem as the venv)
 # so uv can hardlink wheels instead of byte-copying them. Avoids multi-minute stalls on
@@ -191,11 +200,29 @@ if [[ "${INSTALL_DATA}" == "1" ]]; then
   TOK_DIR="./data/tokenizers"
   log "target dataset dir : ${DATA_DIR}"
   log "target tokenizer dir: ${TOK_DIR}"
-  log "downloading variant=${FINEWEB_VARIANT}  train_shards=${TRAIN_SHARDS}"
-  log "(each shard is ~100 MB; ${TRAIN_SHARDS} shards ≈ $((TRAIN_SHARDS * 100)) MB — may take several minutes)"
-  python data/cached_challenge_fineweb.py \
-    --variant "${FINEWEB_VARIANT}" \
-    --train-shards "${TRAIN_SHARDS}"
+
+  # sp1024/byte260: use cached challenge artifacts from HF.
+  # Other SP variants (e.g. sp8192): build/export locally via build_sp_dataset.sh.
+  if [[ "${FINEWEB_VARIANT}" == "sp1024" || "${FINEWEB_VARIANT}" == "byte260" ]]; then
+    log "downloading cached variant=${FINEWEB_VARIANT}  train_shards=${TRAIN_SHARDS}"
+    log "(each shard is ~100 MB; ${TRAIN_SHARDS} shards ≈ $((TRAIN_SHARDS * 100)) MB — may take several minutes)"
+    python data/cached_challenge_fineweb.py \
+      --variant "${FINEWEB_VARIANT}" \
+      --train-shards "${TRAIN_SHARDS}"
+  elif [[ "${FINEWEB_VARIANT}" =~ ^sp([0-9]+)$ ]]; then
+    vocab_size="${BASH_REMATCH[1]}"
+    log "building/exporting local variant=${FINEWEB_VARIANT} (VOCAB_SIZE=${vocab_size})"
+    log "this path trains/reuses SentencePiece then exports shards"
+    VOCAB_SIZE="${vocab_size}" \
+    MAX_TRAIN_SHARDS="${TRAIN_SHARDS}" \
+    VENV_DIR="${VENV_DIR}" \
+    OUTPUT_ROOT="./data" \
+    bash ./build_sp_dataset.sh
+  else
+    echo "ERROR: unsupported FINEWEB_VARIANT='${FINEWEB_VARIANT}'. Expected byte260 or sp<VOCAB_SIZE>." >&2
+    exit 1
+  fi
+
   log "dataset files:"
   ls -lh "${DATA_DIR}"/ 2>/dev/null | head -20 || true
   log "tokenizer files:"

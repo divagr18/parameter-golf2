@@ -1,6 +1,28 @@
 # Best Known Parameters (Live)
 
-Last updated: 2026-04-07
+Last updated: 2026-04-23
+
+## 🔒 Locked Best (1xH100, SP8192 unigram, 10 min)
+
+- `RUN_ID=sp8192_1xh100_nodistill_unigram`
+- Stop: `7221` steps in `600s`
+- Pre-quant val: `val_bpb=1.2317`
+- Final roundtrip: `final_int8_zstd_roundtrip_exact val_bpb=1.24026991`
+- Budget: `int8+zstd total=15905999` (headroom `94001`)
+
+This is the current locked best single-H100 SP8192 run in this workspace.
+
+### Locked knobs for this baseline
+- `VOCAB_SIZE=8192`
+- `DATA_PATH=./data/datasets/fineweb10B_sp8192`
+- `TOKENIZER_PATH=./data/tokenizers/fineweb_8192_unigram_20260422_225958.model`
+- `MODEL_DIM=448`, `NUM_LAYERS=9`, `NUM_HEADS=8`, `NUM_KV_HEADS=4`, `MLP_MULT=2`
+- `TARGET_GPUS=1`, `TARGET_GLOBAL_TOKENS=65536`, `GRAD_ACCUM_STEPS=1`
+- `DISTILL_ENABLED=0`, `BIGRAM_RANK=0`, `RESIDUAL_NGRAM_ENABLED=0`, `TTT_ENABLED=0`
+- `SWA_ENABLED=1`, `QK_GAIN_INIT=5.0`, `GPTQ=1`, `QUANT_SCHEME=int8`, `COMPRESSOR=zstd`
+
+### Rejected follow-up (for now)
+- Bigger + bigram + residual n-grams run: over budget (`17029120`, `+1029120`) and worse final bpb (`1.24202529`).
 
 This file tracks the best-performing known settings for the 1-GPU 10-minute cap16 workflow, plus what has been tested and rejected.
 
