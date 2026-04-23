@@ -3164,7 +3164,7 @@ class GPT(nn.Module):
                             # Always compute JPCR loss when teacher targets exist.
                             # jpcr_weight=0 before distill → no gradient impact.
                             # No branch on len(intermediates) to avoid torch.compile retrace.
-                            target_idx = i - self.intra_loop_start
+                            target_idx = (i + s) - self.intra_loop_start
                             if target_idx < len(jpcr_teacher_intermediates):
                                 teacher_target = jpcr_teacher_intermediates[target_idx]
                                 jpcr_loss = jpcr_loss + predictor.compute_loss(predicted_target, teacher_target)
@@ -3189,7 +3189,7 @@ class GPT(nn.Module):
                         if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
                             predictor = self.jpcr_predictors[j - self.intra_loop_start]
                             predicted_target, gate = predictor(x)
-                            target_idx = j - self.intra_loop_start
+                            target_idx = (j + s) - self.intra_loop_start
                             if target_idx < len(jpcr_teacher_intermediates):
                                 teacher_target = jpcr_teacher_intermediates[target_idx]
                                 jpcr_loss = jpcr_loss + predictor.compute_loss(predicted_target, teacher_target)
@@ -4132,10 +4132,9 @@ def main() -> None:
             jpcr_active_weight = args.jpcr_weight * jpcr_ramp
             # Freeze/unfreeze blend gates: let predictor learn before gate opens
             gate_frozen = jpcr_steps_since < 300
-            for p in base_model.jpcr_predictors:
-                p.blend_gate.requires_grad_(not gate_frozen)
         else:
             jpcr_active_weight = 0.0
+            gate_frozen = False
         dual_head_active_weight = (
             float(args.dual_head_weight)
             if args.dual_head_enabled and step >= dual_head_start_step and args.dual_head_weight > 0.0
@@ -4234,6 +4233,10 @@ def main() -> None:
                 )
             train_loss += loss.detach()
             (loss * grad_scale).backward()
+            if gate_frozen:
+                for p in base_model.jpcr_predictors:
+                    if p.blend_gate.grad is not None:
+                        p.blend_gate.grad = None
         train_loss /= grad_accum_steps
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
