@@ -16,6 +16,7 @@ set -euo pipefail
 #   VENV_DIR=.venv           virtualenv to use (must be set up by setup_h100_env_and_data.sh first)
 #   OUTPUT_ROOT=./data       root dir for tokenizers/ and datasets/ output
 #   TOKENIZER_TRAIN_DOCS=    limit docs used to train the SP model (default: all ~15M)
+#   EXISTING_TOKENIZER_MODEL= path to an existing .model file to reuse for VOCAB_SIZE
 #   HF_TOKEN=                HuggingFace token for faster/authenticated downloads
 
 cd "$(dirname "$0")"
@@ -25,6 +26,7 @@ VENV_DIR="${VENV_DIR:-.venv}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-./data}"
 MAX_TRAIN_SHARDS="${MAX_TRAIN_SHARDS:-80}"
 TOKENIZER_TRAIN_DOCS="${TOKENIZER_TRAIN_DOCS:-}"
+EXISTING_TOKENIZER_MODEL="${EXISTING_TOKENIZER_MODEL:-}"
 
 # Helpers
 log()    { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -69,8 +71,9 @@ step "2/3  Build temporary tokenizer spec"
 #   - byte_fallback=false + coverage=0.99999 : reclaim 256 slots for merges
 #
 # Any *other* existing SP models are passed via --reuse-sp-model so they
-# are not needlessly retrained. The target VOCAB_SIZE is always retrained
-# so stale BPE models are never reused with the wrong model_type.
+# are not needlessly retrained. By default, the target VOCAB_SIZE is
+# retrained; set EXISTING_TOKENIZER_MODEL to explicitly reuse a specific
+# target model when exporting shards.
 
 SPEC_FILE="$(mktemp /tmp/sp_spec_XXXXXX.json)"
 cat > "${SPEC_FILE}" <<JSON
@@ -103,6 +106,19 @@ log "tokenizer spec written to ${SPEC_FILE}"
 # Skip the target VOCAB_SIZE — always retrain it so stale BPE models
 # are never silently reused with the wrong model_type/settings.
 REUSE_ARGS=()
+
+# Optional explicit reuse for the target VOCAB_SIZE.
+# This allows rebuilding/exporting shards with a specific existing tokenizer file
+# without retraining the target vocab model.
+if [[ -n "${EXISTING_TOKENIZER_MODEL}" ]]; then
+  if [[ ! -f "${EXISTING_TOKENIZER_MODEL}" ]]; then
+    echo "ERROR: EXISTING_TOKENIZER_MODEL not found: ${EXISTING_TOKENIZER_MODEL}" >&2
+    exit 1
+  fi
+  log "explicit tokenizer reuse enabled for sp${VOCAB_SIZE}: ${EXISTING_TOKENIZER_MODEL}"
+  REUSE_ARGS+=(--reuse-sp-model "${VOCAB_SIZE}=${EXISTING_TOKENIZER_MODEL}")
+fi
+
 for MODEL_FILE in "${OUTPUT_ROOT}"/tokenizers/fineweb_*_bpe.model; do
   [[ -f "${MODEL_FILE}" ]] || continue
   # Extract vocab size from filename: fineweb_1024_bpe.model -> 1024
@@ -116,7 +132,11 @@ PY
     log "reusing existing sp${EXISTING_VS} tokenizer: ${MODEL_FILE}"
     REUSE_ARGS+=(--reuse-sp-model "${EXISTING_VS}=${MODEL_FILE}")
   elif [[ "${EXISTING_VS}" == "${VOCAB_SIZE}" ]]; then
-    log "found existing sp${EXISTING_VS} model but NOT reusing — will retrain with improved settings"
+    if [[ -n "${EXISTING_TOKENIZER_MODEL}" ]]; then
+      log "found existing sp${EXISTING_VS} model and will reuse explicit model path"
+    else
+      log "found existing sp${EXISTING_VS} model but NOT reusing — will retrain with improved settings"
+    fi
   fi
 done
 
