@@ -93,9 +93,23 @@ fi
 source "${VENV_DIR}/bin/activate"
 log "activated: $(python --version 2>&1)"
 
+VENV_PYTHON="${VENV_DIR}/bin/python"
+if [[ ! -x "${VENV_PYTHON}" ]]; then
+  echo "ERROR: virtualenv python not found at ${VENV_PYTHON}" >&2
+  exit 1
+fi
+
+# Ensure pip exists inside the venv so installs never leak to global Python.
+if ! "${VENV_PYTHON}" -m pip --version >/dev/null 2>&1; then
+  log "pip missing in virtualenv; bootstrapping with ensurepip ..."
+  "${VENV_PYTHON}" -m ensurepip --upgrade
+fi
+"${VENV_PYTHON}" -m pip install -q --upgrade pip setuptools wheel
+log "venv pip: $("${VENV_PYTHON}" -m pip --version 2>&1)"
+
 if ! command -v uv >/dev/null 2>&1; then
   log "installing uv in virtualenv ..."
-  python -m pip install -q uv
+  "${VENV_PYTHON}" -m pip install -q uv
 fi
 log "using $(uv --version 2>&1)"
 elapsed
@@ -111,30 +125,30 @@ if [[ -n "${UV_LINK_MODE:-}" ]]; then
 fi
 
 log "installing requirements.txt with uv (cache=${UV_CACHE_DIR}) ..."
-if ! uv pip install "${UV_LINK_MODE_FLAG[@]}" -U -r requirements.txt; then
+if ! uv pip install --python "${VENV_PYTHON}" "${UV_LINK_MODE_FLAG[@]}" -U -r requirements.txt; then
   log "WARNING: uv failed to inspect the venv interpreter (likely a 'python' pkg conflict)."
   log "Falling back to plain pip for requirements.txt ..."
-  pip install -U -r requirements.txt
+  "${VENV_PYTHON}" -m pip install -U -r requirements.txt
 fi
 elapsed
 
 # zstandard: try pre-built binary first (no C compilation = no hangs).
 # Fall back to source build only if no wheel is available.
 log "installing zstandard (binary wheel preferred) ..."
-if uv pip install "${UV_LINK_MODE_FLAG[@]}" "zstandard>=0.22" --no-build 2>/dev/null; then
+if uv pip install --python "${VENV_PYTHON}" "${UV_LINK_MODE_FLAG[@]}" "zstandard>=0.22" --no-build 2>/dev/null; then
   log "zstandard installed from pre-built wheel"
-elif uv pip install "${UV_LINK_MODE_FLAG[@]}" "zstandard>=0.22" 2>/dev/null; then
+elif uv pip install --python "${VENV_PYTHON}" "${UV_LINK_MODE_FLAG[@]}" "zstandard>=0.22" 2>/dev/null; then
   log "zstandard installed (compiled from source)"
 else
   log "WARNING: uv failed for zstandard, falling back to pip ..."
-  pip install "zstandard>=0.22" --only-binary=:all: || pip install "zstandard>=0.22"
+  "${VENV_PYTHON}" -m pip install "zstandard>=0.22" --only-binary=:all: || "${VENV_PYTHON}" -m pip install "zstandard>=0.22"
 fi
 elapsed
 
 if [[ "${FORCE_CUDA_TORCH}" == "1" ]]; then
   log "installing CUDA torch==${TORCH_VERSION} + torchvision==${VISION_VERSION} + torchaudio==${AUDIO_VERSION} ..."
   log "(uv hangs on the torch wheel install in some RunPod setups; pip handles it reliably)"
-  pip install --no-cache-dir --progress-bar on -U \
+  "${VENV_PYTHON}" -m pip install --no-cache-dir --progress-bar on -U \
     "torch==${TORCH_VERSION}" \
     "torchvision==${VISION_VERSION}" \
     "torchaudio==${AUDIO_VERSION}" \
