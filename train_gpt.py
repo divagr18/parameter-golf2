@@ -209,6 +209,7 @@ class Hyperparameters:
     # At inference, predictors run as part of the model (no teacher needed).
     jpcr_enabled = bool(int(os.environ.get("JPCR_ENABLED", "0")))
     jpcr_hidden = int(os.environ.get("JPCR_HIDDEN", "128"))   # predictor MLP hidden dim
+    jpcr_proj_dim = int(os.environ.get("JPCR_PROJ_DIM", str(jpcr_hidden)))
     jpcr_weight = float(os.environ.get("JPCR_WEIGHT", "0.1"))  # JEPA MSE loss weight
     jpcr_blend_init = float(os.environ.get("JPCR_BLEND_INIT", "-2.0"))  # logit for sigmoid gate init (~0.12)
     jpcr_lr = float(os.environ.get("JPCR_LR", "0.02"))  # predictor learning rate
@@ -771,11 +772,16 @@ def forward_eval_outputs(
     eval_model = get_eval_model(model)
     orig_rope_bases = apply_eval_rope_scaling(model, args, seq_len, rope_scale)
     try:
+        jpcr_runtime_active = bool(getattr(eval_model, "jpcr_enabled", False))
         if autocast_enabled:
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                hidden, logits, logits_are_log_probs = eval_model.forward_hidden_and_output(x)
+                hidden, logits, logits_are_log_probs = eval_model.forward_hidden_and_output(
+                    x, jpcr_runtime_active=jpcr_runtime_active
+                )
         else:
-            hidden, logits, logits_are_log_probs = eval_model.forward_hidden_and_output(x)
+            hidden, logits, logits_are_log_probs = eval_model.forward_hidden_and_output(
+                x, jpcr_runtime_active=jpcr_runtime_active
+            )
     finally:
         restore_eval_rope_scaling(orig_rope_bases)
     log_probs = logits.float().reshape(x.size(0), x.size(1), -1)
@@ -2592,9 +2598,9 @@ class JPCRPredictor(nn.Module):
         # Instance-normalize teacher target (data2vec): zero-mean, unit-var per token
         t = teacher_target.float()
         t = (t - t.mean(dim=-1, keepdim=True)) / (t.std(dim=-1, keepdim=True) + 1e-6)
-        # Project both to smaller space
+        # Project both to smaller space. SimSiam/BYOL style: target uses same projection but detached.
         s_proj = self.student_proj(predicted_target.float())
-        t_proj = self.teacher_proj(t)
+        t_proj = self.student_proj(t).detach()
         # Cosine similarity loss: 1 - cos_sim, bounded [0, 2]
         s_norm = F.normalize(s_proj, dim=-1)
         t_norm = F.normalize(t_proj, dim=-1)
@@ -3001,12 +3007,13 @@ class GPT(nn.Module):
             x = x * (1.0 + scale.tanh()) + shift
         return x
 
-    def _forward_hidden(self, input_ids: Tensor) -> Tensor:
+    def _forward_hidden(self, input_ids: Tensor, *, jpcr_runtime_active: bool | None = None) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.embed_scale:
             x = x * self._embed_scale_factor
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
+        jpcr_runtime_active = self.jpcr_enabled if jpcr_runtime_active is None else bool(jpcr_runtime_active)
         if self.use_recurrence:
             for _ in range(self.recurrent_steps):
                 for block in self.blocks:
@@ -3014,7 +3021,7 @@ class GPT(nn.Module):
         else:
             skips: list[Tensor] = []
             for i in range(self.num_encoder_layers):
-                n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
+                n_rep = self.intra_loop_steps if (jpcr_runtime_active and self.intra_loop_start <= i <= self.intra_loop_end) else 1
                 for s in range(n_rep):
                     if n_rep > 1 and s > 0:
                         x = self._apply_loop_conditioning(x, i, s)
@@ -3024,14 +3031,14 @@ class GPT(nn.Module):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 j = self.num_encoder_layers + i
-                n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
+                n_rep = self.intra_loop_steps if (jpcr_runtime_active and self.intra_loop_start <= j <= self.intra_loop_end) else 1
                 for s in range(n_rep):
                     if n_rep > 1 and s > 0:
                         x = self._apply_loop_conditioning(x, j, s)
                     x, _ = self.blocks[j](x, x0)
         return self.final_norm(x)
 
-    def _forward_hidden_with_intermediates(self, input_ids: Tensor) -> tuple[Tensor, list[Tensor]]:
+    def _forward_hidden_with_intermediates(self, input_ids: Tensor, *, jpcr_runtime_active: bool | None = None) -> tuple[Tensor, list[Tensor]]:
         """Forward pass capturing hidden states ONLY for looped blocks (NO loop, NO conditioning).
 
         Used by the EMA teacher to provide clean JEPA targets for JPCR predictors.
@@ -3045,6 +3052,7 @@ class GPT(nn.Module):
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         intermediates: list[Tensor] = []
+        jpcr_runtime_active = self.jpcr_enabled if jpcr_runtime_active is None else bool(jpcr_runtime_active)
         if self.use_recurrence:
             for _ in range(self.recurrent_steps):
                 for block in self.blocks:
@@ -3053,7 +3061,7 @@ class GPT(nn.Module):
             skips: list[Tensor] = []
             for i in range(self.num_encoder_layers):
                 x, _ = self.blocks[i](x, x0)
-                if self.intra_loop_start <= i <= self.intra_loop_end:
+                if jpcr_runtime_active and self.intra_loop_start <= i <= self.intra_loop_end:
                     intermediates.append(x)
                 skips.append(x)
             for i in range(self.num_decoder_layers):
@@ -3061,12 +3069,12 @@ class GPT(nn.Module):
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 j = self.num_encoder_layers + i
                 x, _ = self.blocks[j](x, x0)
-                if self.intra_loop_start <= j <= self.intra_loop_end:
+                if jpcr_runtime_active and self.intra_loop_start <= j <= self.intra_loop_end:
                     intermediates.append(x)
         return self.final_norm(x), intermediates
 
-    def forward_hidden_and_output(self, input_ids: Tensor) -> tuple[Tensor, Tensor, bool]:
-        h = self._forward_hidden(input_ids)
+    def forward_hidden_and_output(self, input_ids: Tensor, *, jpcr_runtime_active: bool | None = None) -> tuple[Tensor, Tensor, bool]:
+        h = self._forward_hidden(input_ids, jpcr_runtime_active=jpcr_runtime_active)
         flat_h = h.reshape(-1, h.size(-1))
         if self.tie_embeddings:
             logits_proj = F.linear(flat_h, self.tok_emb.weight)
@@ -3088,10 +3096,10 @@ class GPT(nn.Module):
         _, logits, _ = self.forward_hidden_and_output(input_ids)
         return logits
 
-    def forward_logits_and_intermediates(self, input_ids: Tensor) -> tuple[Tensor, list[Tensor]]:
+    def forward_logits_and_intermediates(self, input_ids: Tensor, *, jpcr_runtime_active: bool | None = None) -> tuple[Tensor, list[Tensor]]:
         """Forward pass returning logits AND per-block hidden states for JPCR teacher.
         Same format caveat as forward_logits: log-probs when copy_cache is enabled."""
-        h, intermediates = self._forward_hidden_with_intermediates(input_ids)
+        h, intermediates = self._forward_hidden_with_intermediates(input_ids, jpcr_runtime_active=jpcr_runtime_active)
         flat_h = h.reshape(-1, h.size(-1))
         if self.tie_embeddings:
             logits_proj = F.linear(flat_h, self.tok_emb.weight)
@@ -3580,7 +3588,7 @@ def main() -> None:
         dual_head_num_classes=4,
         jpcr_enabled=args.jpcr_enabled,
         jpcr_hidden=args.jpcr_hidden,
-        jpcr_proj_dim=args.jpcr_hidden,  # projection dim = hidden dim for simplicity
+        jpcr_proj_dim=args.jpcr_proj_dim,
         jpcr_blend_init=args.jpcr_blend_init,
         use_sandwich_norm=args.use_sandwich_norm,
         embed_scale=args.embed_scale,
@@ -4159,7 +4167,9 @@ def main() -> None:
                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
                     if jpcr_runtime_active and args.jpcr_weight > 0.0:
                         # Capture both logits and per-block intermediates for JPCR
-                        teacher_logits, teacher_intermediates = ema_teacher.forward_logits_and_intermediates(x)
+                        teacher_logits, teacher_intermediates = ema_teacher.forward_logits_and_intermediates(
+                            x, jpcr_runtime_active=True
+                        )
                         teacher_logits = teacher_logits.detach()
                         teacher_intermediates = [h.detach() for h in teacher_intermediates]
                     else:
