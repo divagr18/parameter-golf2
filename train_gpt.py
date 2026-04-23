@@ -613,6 +613,8 @@ def resolve_train_loss_mask_stride_frac(args: Hyperparameters) -> float:
 def resolve_distill_start_step(args: Hyperparameters) -> int:
     if args.distill_start_step >= 0:
         return args.distill_start_step
+    if args.distill_start_frac < 0.0:
+        return args.iterations + 1  # Never trigger via fraction if negative
     return int(max(0.0, min(1.0, args.distill_start_frac)) * args.iterations)
 
 
@@ -625,7 +627,7 @@ def distill_is_active(
 ) -> bool:
     if args.distill_start_step >= 0:
         return step >= args.distill_start_step
-    if args.distill_start_wallclock_frac >= 0.0 and max_wallclock_ms is not None:
+    if args.distill_start_wallclock_frac >= 0.0 and max_wallclock_ms is not None and max_wallclock_ms > 0.0:
         start_frac = max(0.0, min(1.0, args.distill_start_wallclock_frac))
         return elapsed_ms >= start_frac * max_wallclock_ms
     return step >= distill_start_step
