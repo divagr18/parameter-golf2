@@ -31,9 +31,9 @@ if ! command -v torchrun >/dev/null 2>&1; then
   echo "torchrun not found. Run: bash ./setup_h100_env_and_data.sh" >&2
   exit 1
 fi
-export VOCAB_SIZE="${VOCAB_SIZE:-1024}"
+export VOCAB_SIZE="${VOCAB_SIZE:-8192}"
 export DATA_PATH="${DATA_PATH:-./data/datasets/fineweb10B_sp${VOCAB_SIZE}}"
-export TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_${VOCAB_SIZE}_bpe.model}"
+export TOKENIZER_PATH="${TOKENIZER_PATH:-./data/tokenizers/fineweb_8192_unigram_20260422_225958.model}"
 
 if [[ ! -f "${TOKENIZER_PATH}" ]]; then
   echo "Tokenizer missing at ${TOKENIZER_PATH}" >&2
@@ -50,7 +50,7 @@ if [[ -z "${gpu_count}" || "${gpu_count}" -lt 1 ]]; then
   exit 1
 fi
 
-target_gpus="${TARGET_GPUS:-8}"
+target_gpus="${TARGET_GPUS:-1}"
 if [[ -n "${NPROC_PER_NODE:-}" ]]; then
   nproc_per_node="${NPROC_PER_NODE}"
 elif [[ "${gpu_count}" -ge "${target_gpus}" ]]; then
@@ -71,7 +71,7 @@ fi
 export GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 seq_len=1024
 if [[ -z "${TRAIN_BATCH_TOKENS:-}" ]]; then
-  target_global_tokens="${TARGET_GLOBAL_TOKENS:-524288}"
+  target_global_tokens="${TARGET_GLOBAL_TOKENS:-65536}"
   local_tokens=$(( target_global_tokens / (nproc_per_node * GRAD_ACCUM_STEPS) ))
   local_tokens=$(( (local_tokens / seq_len) * seq_len ))
   if [[ "${local_tokens}" -lt "${seq_len}" ]]; then
@@ -84,7 +84,7 @@ fi
 export VAL_BATCH_SIZE=$(( nproc_per_node * GRAD_ACCUM_STEPS * local_tokens * 2 ))
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
-export RUN_ID="${RUN_ID:-phase4_fixed_${timestamp}_s${SEED:-1337}}"
+export RUN_ID="${RUN_ID:-sp8192_1xh100_nodistill_unigram}"
 
 # -----------------------------------------------------------------
 # Core runtime — BUG FIX 2: compile=1
@@ -122,7 +122,7 @@ export MIXED_LOW_PRECISION_SCHEME="${MIXED_LOW_PRECISION_SCHEME:-int8}"
 # Baseline vanilla transformer gets ~43ms/step (~13800 steps).
 # Muon alone on the same-size model should beat 1.2244 baseline bpb.
 # -----------------------------------------------------------------
-export MODEL_DIM="${MODEL_DIM:-512}"
+export MODEL_DIM="${MODEL_DIM:-448}"
 export NUM_LAYERS="${NUM_LAYERS:-9}"
 export NUM_HEADS="${NUM_HEADS:-8}"
 export NUM_KV_HEADS="${NUM_KV_HEADS:-4}"
@@ -137,14 +137,14 @@ export SHARE_FFN_ACROSS_BLOCKS="${SHARE_FFN_ACROSS_BLOCKS:-0}"
 # E.g. INTRA_LOOP_START=0 INTRA_LOOP_END=2 INTRA_LOOP_STEPS=3 → 9L→15 eff layers, ~1.67x slower/step.
 export INTRA_LOOP_START="${INTRA_LOOP_START:--1}"   # -1 = disabled
 export INTRA_LOOP_END="${INTRA_LOOP_END:--1}"
-export INTRA_LOOP_STEPS="${INTRA_LOOP_STEPS:-3}"
+export INTRA_LOOP_STEPS="${INTRA_LOOP_STEPS:-1}"
 
 # Parallel residuals: attn and MLP run on same pre-norm input, outputs summed.
 # Saves one RMSNorm per block; improved gradient flow. Leaderboard PR #1477.
 export PARALLEL_RESIDUAL="${PARALLEL_RESIDUAL:-0}"
 
 # SwiGLU: better activation than relu² at same parameter budget
-export USE_SWIGLU="${USE_SWIGLU:-0}"
+export USE_SWIGLU="${USE_SWIGLU:-1}"
 
 # Mixture of Experts (MoE): replace dense MLPs with sparse expert routing.
 # MOE_NUM_EXPERTS=0 → disabled (dense).  2+ → Expert Choice routing.
@@ -172,7 +172,7 @@ export QAT_LSQ="${QAT_LSQ:-0}"
 # When GPTQ=1, calibration data is run through the model after training to collect
 # Hessian statistics, then weights are quantized column-by-column with error
 # compensation. Typically gives 0.01-0.015 BPB improvement over naive quantization.
-export GPTQ="${GPTQ:-0}"
+export GPTQ="${GPTQ:-1}"
 export GPTQ_NSAMPLES="${GPTQ_NSAMPLES:-128}"
 export GPTQ_BLOCKSIZE="${GPTQ_BLOCKSIZE:-128}"
 export GPTQ_PERCDAMP="${GPTQ_PERCDAMP:-0.01}"
@@ -190,10 +190,11 @@ export MTP_WEIGHT="${MTP_WEIGHT:-0.3}"
 export MTP_DECAY="${MTP_DECAY:-1.0}"
 export MTP_TIE_EMBEDDINGS="${MTP_TIE_EMBEDDINGS:-1}"
 export MTP_LR="${MTP_LR:-0.02}"
+export TTT_ENABLED="${TTT_ENABLED:-0}"
 
 # On-the-fly distillation + logit range regularization
 export DISTILL_ENABLED="${DISTILL_ENABLED:-0}"
-export DISTILL_START_FRAC="${DISTILL_START_FRAC:-0.7}"
+export DISTILL_START_FRAC="${DISTILL_START_FRAC:--1}"
 export DISTILL_WEIGHT="${DISTILL_WEIGHT:-0.1}"
 export DISTILL_TEMP="${DISTILL_TEMP:-1.5}"
 export DISTILL_EMA_DECAY="${DISTILL_EMA_DECAY:-0.999}"
@@ -253,7 +254,7 @@ export FINAL_EVAL_MODE="${FINAL_EVAL_MODE:-primary}"
 # 3. Low-rank bigram logit bias: learnable factored n-gram prior on top of neural model.
 #    BIGRAM_RANK=32 adds ~64K int8 params (≈32KB), well within the 164KB budget headroom.
 #    Set to 0 to disable.
-export BIGRAM_RANK="${BIGRAM_RANK:-32}"
+export BIGRAM_RANK="${BIGRAM_RANK:-0}"
 export BIGRAM_LR="${BIGRAM_LR:-0.04}"
 
 # 3b. Residual n-gram modeling: mixture of neural LM and cheap n-gram baseline.
@@ -283,7 +284,7 @@ export DISTILL_START_STEP="${DISTILL_START_STEP:--1}"
 export DISTILL_START_WALLCLOCK_FRAC="${DISTILL_START_WALLCLOCK_FRAC:--1.0}"
 
 # Attention QK-Gain init (leaderboard uses 5.0-5.25 for sharper attention)
-export QK_GAIN_INIT="${QK_GAIN_INIT:-1.5}"
+export QK_GAIN_INIT="${QK_GAIN_INIT:-5.0}"
 
 # Best Muon profile from phase3 sweep (now with MuonEq-R row equilibration)
 export MUON_MOMENTUM="${MUON_MOMENTUM:-0.98}"
