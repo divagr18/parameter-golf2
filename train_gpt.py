@@ -3148,9 +3148,13 @@ class GPT(nn.Module):
                     moe_z_loss = moe_z_loss + zl
         else:
             skips: list[Tensor] = []
+            # Only enable repeated intra-loop passes when loop conditioning is active.
+            # For JPCR this means post-distill runtime activation; for Ouroboros
+            # (controllers present) this remains active whenever configured.
+            loop_active = jpcr_runtime_active or len(self.intra_loop_controllers) > 0
             # First half stores skips; second half reuses them in reverse order.
             for i in range(self.num_encoder_layers):
-                n_rep = self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1
+                n_rep = (self.intra_loop_steps if self.intra_loop_start <= i <= self.intra_loop_end else 1) if loop_active else 1
                 for s in range(n_rep):
                     if n_rep > 1 and s > 0:
                         if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
@@ -3179,7 +3183,7 @@ class GPT(nn.Module):
                 if skips:
                     x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
                 j = self.num_encoder_layers + i
-                n_rep = self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1
+                n_rep = (self.intra_loop_steps if self.intra_loop_start <= j <= self.intra_loop_end else 1) if loop_active else 1
                 for s in range(n_rep):
                     if n_rep > 1 and s > 0:
                         if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
