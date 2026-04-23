@@ -3861,6 +3861,7 @@ def main() -> None:
     # DATA LOADER & MODEL WARMUP
     # -----------------------------
 
+    log0("Initializing DistributedTokenLoader...")
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     def zero_grad_all() -> None:
@@ -3894,9 +3895,11 @@ def main() -> None:
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
+        log0("Saving initial model and optimizer states for warmup...")
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        log0(f"Starting warmup loop ({args.warmup_steps} steps). The first step will trigger torch.compile and may take several minutes...")
         # Pre-build dummy tensors matching the main training loop signature so that
         # torch.compile traces the correct graph during warmup (no re-trace at step 1).
         _warmup_n_jpcr = (base_model.intra_loop_end - base_model.intra_loop_start + 1) if base_model.jpcr_enabled else 0
@@ -3954,7 +3957,7 @@ def main() -> None:
             for opt in optimizers:
                 opt.step()
             zero_grad_all()
-            if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
+            if warmup_step == 0 or args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
