@@ -214,6 +214,10 @@ class Hyperparameters:
     jpcr_blend_init = float(os.environ.get("JPCR_BLEND_INIT", "-2.0"))  # logit for sigmoid gate init (~0.12)
     jpcr_lr = float(os.environ.get("JPCR_LR", "0.02"))  # predictor learning rate
     jpcr_warmup_steps = int(os.environ.get("JPCR_WARMUP_STEPS", "200"))  # ramp JPCR loss weight over this many steps after activation
+    # Distillation/JPCR application cadence. 1 = apply every step.
+    # When >1, distill+JPCR are applied every Nth step (no stale-target reuse).
+    _jpcr_apply_every_env = os.environ.get("JPCR_APPLY_EVERY", os.environ.get("JPCR_TEACHER_EVERY", "1"))
+    jpcr_apply_every = max(1, int(_jpcr_apply_every_env))
     # Dual-head objective: auxiliary coarse-structure prediction head.
     # Classes are derived from token properties (boundary/space/byte-length) and trained
     # with a small coefficient so the main LM head can focus on harder entropy.
@@ -2559,7 +2563,7 @@ class JPCRPredictor(nn.Module):
 
     Architecture:
       Blend path: RMSNorm → Linear(dim, hidden) → SiLU → Linear(hidden, dim) → residual
-      Loss path:  Linear(dim, proj_dim) on both prediction and target, cosine loss
+      Loss path:  shared Linear(dim, proj_dim) on prediction and normalized target, cosine loss
 
     The blend path modifies the recurrence input at inference (no teacher needed).
     The loss path trains the predictor — projects to proj_dim for stable, bounded loss.
@@ -2580,7 +2584,6 @@ class JPCRPredictor(nn.Module):
         nn.init.zeros_(self.proj_out.bias)
         # Loss projection heads (BYOL-style): project to smaller space for loss
         self.student_proj = nn.Linear(model_dim, proj_dim, bias=False)
-        self.teacher_proj = nn.Linear(model_dim, proj_dim, bias=False)
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         """Returns (predicted_target, gate_value). No loss computation here."""
@@ -2600,7 +2603,7 @@ class JPCRPredictor(nn.Module):
         # Instance-normalize teacher target (data2vec): zero-mean, unit-var per token
         t = teacher_target.float()
         t = (t - t.mean(dim=-1, keepdim=True)) / (t.std(dim=-1, keepdim=True) + 1e-6)
-        # Project both to smaller space. SimSiam/BYOL style: target uses same projection but detached.
+        # Project both to smaller space with shared projector, detach target branch.
         s_proj = self.student_proj(predicted_target.float())
         t_proj = self.student_proj(t).detach()
         # Cosine similarity loss: 1 - cos_sim, bounded [0, 2]
@@ -3255,6 +3258,12 @@ class GPT(nn.Module):
             else:
                 aux_loss = aux_per_token.mean()
             total_loss = total_loss + float(aux_weight) * aux_loss
+        elif self.dual_head is not None:
+            # Safety touch keeps dual-head params in graph when auxiliary loss is inactive.
+            total_loss = total_loss + 0.0 * (
+                self.dual_head.weight.reshape(-1)[0].float()
+                + (self.dual_head.bias.reshape(-1)[0].float() if self.dual_head.bias is not None else 0.0)
+            )
 
         if logit_reg_weight > 0.0:
             total_loss = total_loss + float(logit_reg_weight) * logits_proj.float().pow(2).mean()
@@ -3289,6 +3298,11 @@ class GPT(nn.Module):
         if jpcr_count > 0:
             total_loss = total_loss + float(jpcr_weight) * (jpcr_loss / jpcr_count)
             total_loss = total_loss + 0.0 * jpcr_loss
+        if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
+            # Safety touch keeps ALL JPCR params in graph every step (zero gradient where unused).
+            # This supports DDP find_unused_parameters=False with conditional JPCR execution.
+            for p in self.jpcr_predictors.parameters():
+                total_loss = total_loss + 0.0 * p.reshape(-1)[0].float()
 
         # MoE router Z-loss — only during training (loss_mask is None means no sliding-window eval mask).
         # Follows the same pattern as MTP (excluded during eval to keep val_bpb clean).
@@ -3395,6 +3409,17 @@ def main() -> None:
         torch.cuda.set_device(device)
     autocast_enabled = device.type == "cuda"
     use_compile = bool(int(os.environ.get("USE_TORCH_COMPILE", "1" if device.type == "cuda" else "0")))
+    compile_dynamic_mode_raw = os.environ.get("TORCH_COMPILE_DYNAMIC", "true").strip().lower()
+    if compile_dynamic_mode_raw in {"1", "true", "yes", "on"}:
+        compile_dynamic: bool | None = True
+    elif compile_dynamic_mode_raw in {"0", "false", "no", "off"}:
+        compile_dynamic = False
+    elif compile_dynamic_mode_raw in {"none", "auto", "default", ""}:
+        compile_dynamic = None
+    else:
+        raise ValueError(
+            f"Unsupported TORCH_COMPILE_DYNAMIC={compile_dynamic_mode_raw!r}; expected true|false|none"
+        )
     if use_compile:
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
     if distributed:
@@ -3457,7 +3482,11 @@ def main() -> None:
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
-    log0(f"device:{device} distributed:{distributed} use_torch_compile:{use_compile}", console=False)
+    log0(
+        f"device:{device} distributed:{distributed} use_torch_compile:{use_compile} "
+        f"torch_compile_dynamic:{compile_dynamic}",
+        console=False,
+    )
     if device.type == "cuda":
         log0(
             subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
@@ -3607,16 +3636,24 @@ def main() -> None:
         # Python int instance attrs (num_heads, head_dim) are captured as symbolic inputs
         # to a subgraph. With world_size=1 the optimisation is a no-op anyway.
         torch._dynamo.config.optimize_ddp = False
-    compiled_model = torch.compile(base_model, dynamic=True) if use_compile else base_model
+    compiled_model = torch.compile(base_model, dynamic=compile_dynamic) if use_compile else base_model
     model: nn.Module
     if distributed:
+        ddp_find_unused_override = os.environ.get("DDP_FIND_UNUSED_PARAMETERS", "").strip().lower()
         # find_unused_parameters=True is required when QAT_LSQ=1 because
         # qat_log_scale params are registered but sit idle until QAT activates.
-        # Dual-head params can also be intentionally inactive during warmup / before
-        # DUAL_HEAD_START_FRAC, so include that condition as well.
-        # JPCR predictors also have projection heads that are only used once the
-        # JEPA/distill path is active, so treat them as potentially-unused too.
-        _ddp_find_unused = bool(args.qat_lsq or args.dual_head_enabled or args.jpcr_enabled)
+        # Dual-head and JPCR are safety-touched in loss so they remain in graph with zero grads.
+        if ddp_find_unused_override in {"1", "true", "yes", "on"}:
+            _ddp_find_unused = True
+        elif ddp_find_unused_override in {"0", "false", "no", "off"}:
+            _ddp_find_unused = False
+        elif ddp_find_unused_override in {"", "auto", "default"}:
+            _ddp_find_unused = bool(args.qat_lsq)
+        else:
+            raise ValueError(
+                f"Unsupported DDP_FIND_UNUSED_PARAMETERS={ddp_find_unused_override!r}; expected true|false|auto"
+            )
+        log0(f"ddp_find_unused_parameters:{int(_ddp_find_unused)}", console=False)
         model = (
             DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=_ddp_find_unused)
             if device.type == "cuda"
@@ -3806,6 +3843,7 @@ def main() -> None:
         f"distill_enabled:{args.distill_enabled} distill_start_frac:{args.distill_start_frac} "
         f"distill_start_step:{args.distill_start_step} distill_start_wallclock_frac:{args.distill_start_wallclock_frac} "
         f"distill_weight:{args.distill_weight} distill_temp:{args.distill_temp} distill_ema_decay:{args.distill_ema_decay} "
+        f"jpcr_apply_every:{args.jpcr_apply_every} "
         f"logit_reg_weight:{args.logit_reg_weight} byte_weighted_loss:{args.byte_weighted_loss_enabled} "
         f"byte_weighted_loss_alpha:{args.byte_weighted_loss_alpha} "
         f"residual_ngram_enabled:{args.residual_ngram_enabled} residual_bigram_rank:{args.residual_bigram_rank} "
@@ -3990,6 +4028,8 @@ def main() -> None:
             )
         )
         log0(f"distill_start: mode:{distill_mode} resolved_step:{distill_start_step}")
+        if args.jpcr_apply_every > 1:
+            log0(f"jpcr_apply_every:{args.jpcr_apply_every} (distill+JPCR applied every Nth step)")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -4125,7 +4165,8 @@ def main() -> None:
             and args.distill_weight > 0.0
             and distill_is_active(args, step, elapsed_ms, max_wallclock_ms, distill_start_step)
         )
-        jpcr_runtime_active = bool(base_model.jpcr_enabled and distill_active)
+        apply_distill_this_step = bool(distill_active and (step % args.jpcr_apply_every == 0))
+        jpcr_runtime_active = bool(base_model.jpcr_enabled and apply_distill_this_step)
         # JPCR loss warmup: ramp weight from 0 → full over jpcr_warmup_steps after distill activates.
         # Also freeze blend gates for first 300 steps so predictors learn via loss before affecting forward pass.
         if distill_active and base_model.jpcr_enabled:
@@ -4165,13 +4206,13 @@ def main() -> None:
             token_weights: Tensor | None = None
             aux_targets: Tensor | None = None
             train_loss_mask = build_train_loss_mask(x.size(0), curr_seq_len)
-            if distill_active and ema_teacher is not None:
+            if apply_distill_this_step and ema_teacher is not None:
                 # Use no_grad (not inference_mode) because inference tensors can error when
                 # downstream ops save them for backward (e.g., KL in distillation under compile).
                 # Wrap in autocast to match training dtype (bf16) — teacher weights are bf16.
                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
                     if jpcr_runtime_active and args.jpcr_weight > 0.0:
-                        # Capture both logits and per-block intermediates for JPCR
+                        # Capture both logits and per-block intermediates for JPCR.
                         teacher_logits, teacher_intermediates = ema_teacher.forward_logits_and_intermediates(
                             x, jpcr_runtime_active=True
                         )
@@ -4212,7 +4253,7 @@ def main() -> None:
                         aux_targets=aux_targets,
                         aux_weight=dual_head_active_weight,
                         distill_teacher_logits=teacher_logits,
-                        distill_weight=args.distill_weight if distill_active else 0.0,
+                        distill_weight=args.distill_weight if apply_distill_this_step else 0.0,
                         distill_temp=args.distill_temp,
                         logit_reg_weight=args.logit_reg_weight,
                         jpcr_teacher_intermediates=teacher_intermediates,
@@ -4228,7 +4269,7 @@ def main() -> None:
                     aux_targets=aux_targets,
                     aux_weight=dual_head_active_weight,
                     distill_teacher_logits=teacher_logits,
-                    distill_weight=args.distill_weight if distill_active else 0.0,
+                    distill_weight=args.distill_weight if apply_distill_this_step else 0.0,
                     distill_temp=args.distill_temp,
                     logit_reg_weight=args.logit_reg_weight,
                     jpcr_teacher_intermediates=teacher_intermediates,
