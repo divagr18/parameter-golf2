@@ -6,9 +6,10 @@ cd /workspace/parameter-golf
 UNIGRAM_DATA="/workspace/parameter-golf/data/dual_unigram/datasets/fineweb10B_sp8192"
 UNIGRAM_TOK="/workspace/parameter-golf/data/tokenizers/fineweb_8192_unigram_20260422_225958.model"
 WAIT_SHARDS="${WAIT_SHARDS:-80}"
+SEED="${1:-${SEED:-1337}}"
 
-RUN_GROUP="${RUN_GROUP:-sp8192_unigram_parallel_$(date +%Y%m%d_%H%M%S)}"
-RUN_ID="${RUN_ID:-sp8192_unigram_submission_8gpu_$(date +%Y%m%d_%H%M%S)}"
+RUN_GROUP="${RUN_GROUP:-sp8192_unigram_parallel_s${SEED}_$(date +%Y%m%d_%H%M%S)}"
+RUN_ID="${RUN_ID:-sp8192_unigram_submission_8gpu_s${SEED}_$(date +%Y%m%d_%H%M%S)}"
 
 mkdir -p "logs/runs/${RUN_GROUP}" "artifacts/${RUN_GROUP}"
 
@@ -22,7 +23,7 @@ while true; do
   sleep 5
 done
 
-echo "[start] unigram ready, launching training RUN_ID=${RUN_ID}"
+echo "[start] unigram ready, launching training RUN_ID=${RUN_ID} SEED=${SEED}"
 
 RUN_ID="${RUN_ID}" \
 VOCAB_SIZE=8192 \
@@ -31,7 +32,7 @@ TOKENIZER_PATH="${UNIGRAM_TOK}" \
 TARGET_GPUS=8 NPROC_PER_NODE=8 \
 DEVICE=cuda USE_TORCH_COMPILE=1 SDP_BACKEND_MODE=flash \
 ITERATIONS=20000 MAX_WALLCLOCK_SECONDS=600 \
-SEED=1337 GRAD_ACCUM_STEPS=1 \
+SEED="${SEED}" GRAD_ACCUM_STEPS=1 \
 TRAIN_BATCH_TOKENS=524288 VAL_BATCH_SIZE=524288 VAL_LOSS_EVERY=0 VAL_MAX_TOKENS=0 FINAL_ROUNDTRIP_EVAL=1 \
 MODEL_DIM=448 NUM_LAYERS=9 NUM_HEADS=8 NUM_KV_HEADS=4 MLP_MULT=2 TIE_EMBEDDINGS=1 \
 RECURRENT_CORE_LAYERS=0 RECURRENT_STEPS=0 INTRA_LOOP_START=-1 INTRA_LOOP_END=-1 INTRA_LOOP_STEPS=1 \
