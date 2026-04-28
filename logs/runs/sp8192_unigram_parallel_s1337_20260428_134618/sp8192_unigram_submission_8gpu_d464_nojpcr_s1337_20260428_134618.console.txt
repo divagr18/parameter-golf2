@@ -1,0 +1,96 @@
+=== Phase 4 Fixed Submission ===
+run_id:         sp8192_unigram_submission_8gpu_d464_nojpcr_s1337_20260428_134618
+nproc:          8/8 GPUs
+wallclock:      600s  [FIX: was 360]
+compile:        1        [FIX: was 0]
+train_batch:    524288 tokens [FIX: was ~131K]
+grad_accum:     1
+model:          dim=464 layers=9 heads=8 kv=4 mlp_mult=2
+recurrence:     core=0 steps=0  [FIX: was 3×6]
+use_swiglu:     1
+parallel_resid: 0
+moe:            experts=0 every_n=2 cap=1.0 aux=1e-3
+qat:            scheme=none start_step=9000 lsq=0
+gptq:           1 (nsamples=128 blocksize=128 percdamp=0.01)
+qk_gain_init:   5.0
+use_ssm:        0 (every_n=2 expand=2.0 kernel=4)
+use_mtp:        0 (steps=2 weight=0.3 decay=1.0 tie=1 lr=0.02)
+distill:        0 (start_frac=-1 start_step=-1 start_wallclock_frac=-1 weight=0.08 temp=2.0 ema=0.999)
+logit_reg_w:    0.0
+byte_loss:      0 (alpha=1.0)
+dual_head:      0 (weight=0.05 start_frac=0.0 lr=0.02)
+eval_stride:    0.5  (sliding window eval)
+train_mask:     0 (stride_frac=0.0)
+eval_seq_len:   0  (0=train_seq_len)
+eval_rope_scale:1.0
+eval_sweep:      (rope_scales=)
+eval_blend:      (rope_scales= weights= stride_frac=0.0 position_bias=0.0 position_power=1.0)
+eval_cont_cache:0 (window=8192 topk=64 weight=0.12 logit_scale=12.0 conf_power=1.0 batch_seqs=8)
+final_eval_mode:primary
+bigram_rank:    0  (0=disabled)
+residual_ngram: 0 (bigram_rank=0 trigram_rank=0 lr=0.04 mix_init=-2.5)
+copy_cache:     0 (window=256 dim=64 lr=0.02 gate_init=-4.0)
+muon_momentum:  0.98
+grad_clip_norm: 1.0
+quant:          int8+zstd
+log:            logs/sp8192_unigram_submission_8gpu_d464_nojpcr_s1337_20260428_134618.txt
+logs/sp8192_unigram_submission_8gpu_d464_nojpcr_s1337_20260428_134618.txt
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/workspace/parameter-golf/data/tokenizers/fineweb_8192_unigram_20260422_225958.model
+train_loader:dataset:fineweb10B_sp8192 train_shards:80
+val_loader:shards pattern=/workspace/parameter-golf/data/dual_unigram/datasets/fineweb10B_sp8192/fineweb_val_*.bin tokens:40952832 val_max_tokens:full
+eval_primary: seq_len:1024 rope_scale:1.0000 stride_frac:0.5000 final_eval_mode:primary
+eval_cont_cache: enabled:0 window:8192 topk:64 weight:0.1200 logit_scale:12.0000 conf_power:1.0000 batch_seqs:8
+train_loss_mask: enabled:0 stride_frac:0.5000
+model_params:16848840
+world_size:8 grad_accum_steps:1
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False mode=flash
+attention_mode:gqa num_heads:8 num_kv_heads:4 use_swiglu:True use_ssm:False ssm_every_n:2 ssm_expand:2.0 ssm_kernel:4 mtp_enabled:False mtp_steps:2 mtp_weight:0.3 mtp_decay:1.0 mtp_tie_embeddings:True distill_enabled:False distill_start_frac:-1.0 distill_start_step:-1 distill_start_wallclock_frac:-1.0 distill_weight:0.08 distill_temp:2.0 distill_ema_decay:0.999 logit_reg_weight:0.0 byte_weighted_loss:False byte_weighted_loss_alpha:1.0 residual_ngram_enabled:False residual_bigram_rank:0 residual_trigram_rank:0 residual_ngram_lr:0.04 residual_ngram_mix_init:-2.5 ngram_softcap:0.0 ngram_entropy_gate:False ttt_enabled:False ttt_lr:0.001 ttt_steps:1 ttt_momentum:0.9 copy_cache_enabled:False copy_cache_window:256 copy_cache_dim:64 copy_cache_lr:0.02 copy_cache_gate_init:-4.0 dual_head_enabled:False dual_head_weight:0.05 dual_head_start_frac:0.0 dual_head_lr:0.02 qat_scheme:none qat_start_step:9000 moe_num_experts:0 moe_every_n:2 moe_capacity_factor:1.0 moe_aux_loss_coeff:0.001 num_moe_blocks:0
+architecture:stacked num_layers:9 encoder_layers:4 decoder_layers:5 ssm_blocks:0 attn_blocks:9
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04 mtp_lr:0.0 copy_cache_lr:0.0 dual_head_lr:0.0
+train_batch_tokens:524288 train_seq_len:1024 iterations:20000 warmup_steps:200 max_wallclock_seconds:600.000
+seed:1337
+Initializing DistributedTokenLoader...
+Saving initial model and optimizer states for warmup...
+Starting warmup loop (200 steps). The first step will trigger torch.compile and may take several minutes...
+warmup_step:1/200
+warmup_step:10/200
+warmup_step:20/200
+warmup_step:30/200
+warmup_step:40/200
+warmup_step:50/200
+warmup_step:60/200
+warmup_step:70/200
+warmup_step:80/200
+warmup_step:90/200
+warmup_step:100/200
+warmup_step:110/200
+warmup_step:120/200
+warmup_step:130/200
+warmup_step:140/200
+warmup_step:150/200
+warmup_step:160/200
+warmup_step:170/200
+warmup_step:180/200
+warmup_step:190/200
+warmup_step:200/200
+step:1/20000 train_loss:9.0036 train_time:85ms step_avg:84.98ms
+step:2/20000 train_loss:15.2032 train_time:130ms step_avg:64.80ms
+step:3/20000 train_loss:10.1220 train_time:179ms step_avg:59.51ms
+step:4/20000 train_loss:8.3202 train_time:228ms step_avg:57.09ms
+step:5/20000 train_loss:8.4221 train_time:277ms step_avg:55.49ms
+step:6/20000 train_loss:8.3488 train_time:327ms step_avg:54.52ms
+step:7/20000 train_loss:7.9138 train_time:377ms step_avg:53.86ms
+step:8/20000 train_loss:7.8109 train_time:427ms step_avg:53.35ms
+step:9/20000 train_loss:7.4041 train_time:476ms step_avg:52.94ms
+step:10/20000 train_loss:7.2280 train_time:526ms step_avg:52.61ms
+step:200/20000 train_loss:4.0329 train_time:11067ms step_avg:55.34ms
+step:400/20000 train_loss:3.8275 train_time:21100ms step_avg:52.75ms
+step:600/20000 train_loss:3.6641 train_time:31162ms step_avg:51.94ms
+step:800/20000 train_loss:3.4366 train_time:41253ms step_avg:51.57ms
+step:1000/20000 train_loss:3.4784 train_time:51371ms step_avg:51.37ms
+step:1200/20000 train_loss:3.4200 train_time:61512ms step_avg:51.26ms
+step:1400/20000 train_loss:3.2594 train_time:71747ms step_avg:51.25ms
+step:1600/20000 train_loss:3.3404 train_time:81909ms step_avg:51.19ms
+step:1800/20000 train_loss:3.3935 train_time:92058ms step_avg:51.14ms
+step:2000/20000 train_loss:3.3741 train_time:102203ms step_avg:51.10ms
+step:2200/20000 train_loss:3.6820 train_time:112346ms step_avg:51.07ms
