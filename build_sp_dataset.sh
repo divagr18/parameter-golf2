@@ -27,6 +27,9 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-./data}"
 MAX_TRAIN_SHARDS="${MAX_TRAIN_SHARDS:-80}"
 TOKENIZER_TRAIN_DOCS="${TOKENIZER_TRAIN_DOCS:-}"
 EXISTING_TOKENIZER_MODEL="${EXISTING_TOKENIZER_MODEL:-}"
+# Keep HF caches inside workspace by default to avoid filling /root/.cache.
+# You can override with HF_HOME / HUGGINGFACE_HUB_CACHE / HF_DATASETS_CACHE.
+HF_CACHE_ROOT="${HF_CACHE_ROOT:-${OUTPUT_ROOT}/hf_cache}"
 
 # Helpers
 log()    { echo "[$(date '+%H:%M:%S')] $*"; }
@@ -56,6 +59,15 @@ if [[ -n "${HF_TOKEN:-}" ]]; then
 else
   log "HF_TOKEN not set — unauthenticated (may be rate-limited)"
 fi
+
+# Route Hugging Face caches to workspace storage unless explicitly overridden.
+export HF_HOME="${HF_HOME:-${HF_CACHE_ROOT}}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
+mkdir -p "${HF_HOME}" "${HUGGINGFACE_HUB_CACHE}" "${HF_DATASETS_CACHE}"
+log "HF cache root: ${HF_HOME}"
+log "HF hub cache: ${HUGGINGFACE_HUB_CACHE}"
+log "HF datasets cache: ${HF_DATASETS_CACHE}"
 
 # -------------------------------------------------------------------
 step "2/3  Build temporary tokenizer spec"
