@@ -1,0 +1,5 @@
+step:7152/20000 val_loss:3.1342 val_bpb:1.1807 train_time:600032ms step_avg:83.90ms
+stopping_early: wallclock_cap train_time:600032ms step:7152/20000
+submission_budget raw_total:57743147 budget:16000000 over_bytes:41743147
+submission_budget int8+zstd total:15606061 budget:16000000 headroom_bytes:393939
+final_int8_zstd_roundtrip_exact val_loss:3.16562126 val_bpb:1.19250774 mode:primary
