@@ -88,7 +88,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
+    data_path = os.environ.get("DATA_PATH", "./data/dual_bpe/datasets/fineweb10B_sp8192")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
@@ -732,6 +732,29 @@ def get_eval_model(model: nn.Module) -> nn.Module:
     raise AttributeError("Could not find a forward_logits-capable model for evaluation")
 
 
+TTT_PARAM_NAME_MATCH = (
+    "residual_bigram_",
+    "residual_trigram_",
+    "residual_ngram_",
+    "bigram_left",
+    "bigram_right",
+    "bigram_scale",
+    "copy_gate",
+)
+
+
+def collect_ttt_params(raw_model: nn.Module) -> list[tuple[str, nn.Parameter]]:
+    # Keep TTT scoped to the small adaptive heads/tables. Residual n-gram
+    # predictors are named residual_bigram_* / residual_trigram_*, not only
+    # residual_ngram_*, so include all of those prefixes.
+    params: list[tuple[str, nn.Parameter]] = []
+    for name, p in raw_model.named_parameters():
+        leaf = name.rsplit(".", 1)[-1]
+        if any(name.startswith(pref) or leaf.startswith(pref) for pref in TTT_PARAM_NAME_MATCH):
+            params.append((name, p))
+    return params
+
+
 def apply_eval_rope_scaling(
     model: nn.Module,
     args: Hyperparameters,
@@ -844,19 +867,7 @@ def eval_val_single(
     raw_model = get_eval_model(model) if ttt_active else None
     if ttt_active and raw_model is not None:
         # Scope: ngram + pointer-gate + small learned scales. Base transformer stays frozen.
-        ttt_name_match = (
-            "residual_bigram_",
-            "residual_trigram_",
-            "residual_ngram_",
-            "bigram_left",
-            "bigram_right",
-            "bigram_scale",
-            "copy_gate",
-        )
-        for name, p in raw_model.named_parameters():
-            leaf = name.rsplit(".", 1)[-1]
-            if any(name.startswith(pref) or leaf.startswith(pref) for pref in ttt_name_match):
-                ttt_params.append((name, p))
+        ttt_params = collect_ttt_params(raw_model)
         ttt_prev_requires_grad = {id(p): p.requires_grad for p in raw_model.parameters()}
         for p in raw_model.parameters():
             p.requires_grad_(False)
@@ -1114,6 +1125,13 @@ def run_final_eval_suite(
     log0,
 ) -> tuple[float, float]:
     primary_name, primary_seq_len, primary_rope_scale = resolve_primary_eval_spec(args)
+    ttt_param_count = 0
+    if args.ttt_enabled and args.ttt_lr > 0.0:
+        try:
+            ttt_param_count = len(collect_ttt_params(get_eval_model(model)))
+        except AttributeError:
+            ttt_param_count = 0
+    ttt_effective = bool(args.ttt_enabled and args.ttt_lr > 0.0 and ttt_param_count > 0)
     primary_val_loss, primary_val_bpb = eval_val_single(
         args,
         model,
@@ -1129,7 +1147,7 @@ def run_final_eval_suite(
         primary_seq_len,
         primary_rope_scale,
         args.eval_stride_frac,
-        ttt_enabled=args.ttt_enabled,
+        ttt_enabled=ttt_effective,
         ttt_lr=args.ttt_lr,
         ttt_steps=args.ttt_steps,
         ttt_momentum=args.ttt_momentum,
@@ -1137,7 +1155,8 @@ def run_final_eval_suite(
     log0(
         f"{roundtrip_tag}_ctx_exact name:{primary_name} seq_len:{primary_seq_len} "
         f"rope_scale:{primary_rope_scale:.4f} stride_frac:{args.eval_stride_frac:.4f} "
-        f"ttt:{1 if args.ttt_enabled else 0} ttt_lr:{args.ttt_lr} ttt_steps:{args.ttt_steps} "
+        f"ttt:{1 if ttt_effective else 0} ttt_params:{ttt_param_count} "
+        f"ttt_lr:{args.ttt_lr} ttt_steps:{args.ttt_steps} "
         f"val_loss:{primary_val_loss:.8f} val_bpb:{primary_val_bpb:.8f}"
     )
 
@@ -1232,6 +1251,7 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+QUANT_SCALE_EPS = float(os.environ.get("QUANT_SCALE_EPS", "1e-8"))
 INT4_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
@@ -1323,14 +1343,14 @@ def quantize_float_tensor_int8(
         # ranges much better than a single tensor-wide scale.
         if precomputed_scale is not None:
             # LSQ-learned scale: use directly, skip the quantile clip computation.
-            scale = precomputed_scale.float().clamp_min(1.0 / 127.0)
+            scale = precomputed_scale.float().clamp_min(QUANT_SCALE_EPS)
         else:
             clip_abs = (
                 torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
                 if t32.numel()
                 else torch.empty((t32.shape[0],), dtype=torch.float32)
             )
-            scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+            scale = (clip_abs / 127.0).clamp_min(QUANT_SCALE_EPS)
         q = torch.clamp(torch.round(t32 / scale[:, None]), -127, 127).to(torch.int8).contiguous()
         return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous(), {"scheme": "int8_per_row", "axis": 0}
 
@@ -1394,14 +1414,14 @@ def quantize_float_tensor_int5(
     t32 = t.float()
     if t32.ndim == 2:
         if precomputed_scale is not None:
-            scale = precomputed_scale.float().clamp_min(1.0 / 15.0)
+            scale = precomputed_scale.float().clamp_min(QUANT_SCALE_EPS)
         else:
             clip_abs = (
                 torch.quantile(t32.abs(), INT5_CLIP_Q, dim=1)
                 if t32.numel()
                 else torch.empty((t32.shape[0],), dtype=torch.float32)
             )
-            scale = (clip_abs / 15.0).clamp_min(1.0 / 15.0)
+            scale = (clip_abs / 15.0).clamp_min(QUANT_SCALE_EPS)
         q = torch.clamp(torch.round(t32 / scale[:, None]), -16, 15).to(torch.int8)
         packed = pack_int5_signed(q)
         return (
@@ -1422,14 +1442,14 @@ def quantize_float_tensor_int4(
     if t32.ndim == 2:
         if precomputed_scale is not None:
             # LSQ-learned scale: skip quantile, use directly.
-            scale = precomputed_scale.float().clamp_min(1.0 / 7.0)
+            scale = precomputed_scale.float().clamp_min(QUANT_SCALE_EPS)
         else:
             clip_abs = (
                 torch.quantile(t32.abs(), INT4_CLIP_Q, dim=1)
                 if t32.numel()
                 else torch.empty((t32.shape[0],), dtype=torch.float32)
             )
-            scale = (clip_abs / 7.0).clamp_min(1.0 / 7.0)
+            scale = (clip_abs / 7.0).clamp_min(QUANT_SCALE_EPS)
         q = torch.clamp(torch.round(t32 / scale[:, None]), -8, 7).to(torch.int8)
         packed = pack_int4_signed(q)
         return (
@@ -1781,6 +1801,27 @@ def collect_gptq_hessians(
                 return hook_fn
 
             hooks.append(module.register_forward_hook(make_hook(key)))
+
+    # Tied embeddings use F.linear(hidden, tok_emb.weight) instead of a CastedLinear
+    # module, so hook the final normalized hidden states as calibration inputs for
+    # tok_emb.weight. This matters most at large vocab sizes where the tied
+    # embedding/output matrix dominates both parameters and quantization error.
+    if getattr(model, "tie_embeddings", False) and hasattr(model, "tok_emb") and hasattr(model, "final_norm"):
+        key = "tok_emb.weight"
+        emb = getattr(model, "tok_emb")
+        embed_dim = int(getattr(emb, "embedding_dim", 0))
+        if embed_dim > 0 and key not in hessians:
+            hessians[key] = torch.zeros(embed_dim, embed_dim, device=device)
+            sample_counts[key] = 0
+
+            def tied_embedding_hook(_mod, _inp, out):
+                x = out.detach().float()
+                if x.ndim == 3:
+                    x = x.reshape(-1, x.shape[-1])
+                hessians[key].addmm_(x.T, x)
+                sample_counts[key] += x.shape[0]
+
+            hooks.append(model.final_norm.register_forward_hook(tied_embedding_hook))
 
     # Disable QAT fake-quant during calibration
     saved_qat_levels = CastedLinear.qat_levels

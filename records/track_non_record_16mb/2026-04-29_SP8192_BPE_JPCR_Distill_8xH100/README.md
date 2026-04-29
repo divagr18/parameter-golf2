@@ -24,17 +24,19 @@ Operational implementation details (stability/perf):
 
 Dataset/tokenizer requirement:
 - This package expects an **SP8192 exported dataset** at:
-  - `./data/datasets/fineweb10B_sp8192`
+  - `./sp8192_data/datasets/fineweb10B_sp8192`
 - And uses tokenizer assets in this folder by default:
   - `./fineweb_8192_bpe.model`
   - `./fineweb_8192_bpe.vocab`
+- Build the dataset with:
+  - `bash ./setup_sp8192_data.sh`
 
 Command (track-relevant params):
 ```bash
 OMP_NUM_THREADS=1 \
 TORCH_NCCL_ASYNC_ERROR_HANDLING=1 \
 RUN_ID=sp8192_bpe_submission_8gpu_20260428_133231 \
-DATA_PATH=./data/datasets/fineweb10B_sp8192 \
+DATA_PATH=./sp8192_data/datasets/fineweb10B_sp8192 \
 TOKENIZER_PATH=./fineweb_8192_bpe.model \
 VOCAB_SIZE=8192 \
 NUM_LAYERS=9 \

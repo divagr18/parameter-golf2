@@ -14,9 +14,10 @@ set -euo pipefail
 #   TORCH_VERSION=2.10.0
 #   TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 #   TOKENIZER_VOCAB_SIZE=8192   shorthand for FINEWEB_VARIANT=sp8192
-#   FINEWEB_VARIANT=sp1024
+#   FINEWEB_VARIANT=sp8192
 #   TRAIN_SHARDS=80
 #   INSTALL_DATA=1
+#   HF_EXPORTED_DATASET_REPO=Keshav051/fineweb10B_sp8192_dual_bpe
 
 cd "$(dirname "$0")"
 
@@ -33,9 +34,10 @@ VISION_VERSION="${VISION_VERSION:-0.${_VISION_MINOR}.${_TORCH_PATCH}}"
 AUDIO_VERSION="${AUDIO_VERSION:-${TORCH_VERSION}}"
 TORCH_INDEX_URL="${TORCH_INDEX_URL:-https://download.pytorch.org/whl/cu128}"
 TOKENIZER_VOCAB_SIZE="${TOKENIZER_VOCAB_SIZE:-}"
-FINEWEB_VARIANT="${FINEWEB_VARIANT:-sp1024}"
+FINEWEB_VARIANT="${FINEWEB_VARIANT:-sp8192}"
 TRAIN_SHARDS="${TRAIN_SHARDS:-80}"
 INSTALL_DATA="${INSTALL_DATA:-1}"
+HF_EXPORTED_DATASET_REPO="${HF_EXPORTED_DATASET_REPO:-Keshav051/fineweb10B_sp8192_dual_bpe}"
 
 # Allow shorthand: TOKENIZER_VOCAB_SIZE=8192 or FINEWEB_VARIANT=8192
 if [[ -n "${TOKENIZER_VOCAB_SIZE}" ]]; then
@@ -61,6 +63,7 @@ log "setup_h100_env_and_data.sh starting"
 log "python_bin=${PYTHON_BIN}  venv=${VENV_DIR}  force_cuda_torch=${FORCE_CUDA_TORCH}"
 log "torch_version=${TORCH_VERSION}  vision_version=${VISION_VERSION}  audio_version=${AUDIO_VERSION}  index_url=${TORCH_INDEX_URL}"
 log "fineweb_variant=${FINEWEB_VARIANT}  train_shards=${TRAIN_SHARDS}  install_data=${INSTALL_DATA}"
+log "hf_exported_dataset_repo=${HF_EXPORTED_DATASET_REPO}"
 
 # -------------------------------------------------------------------
 step "1/4  Python & UV check"
@@ -198,6 +201,7 @@ step "4/4  FineWeb dataset download"
 if [[ "${INSTALL_DATA}" == "1" ]]; then
   DATA_DIR="./data/datasets/fineweb10B_${FINEWEB_VARIANT}"
   TOK_DIR="./data/tokenizers"
+  DUAL_BPE_DIR="./data/dual_bpe/datasets/fineweb10B_sp8192"
   log "target dataset dir : ${DATA_DIR}"
   log "target tokenizer dir: ${TOK_DIR}"
 
@@ -209,6 +213,22 @@ if [[ "${INSTALL_DATA}" == "1" ]]; then
     python data/cached_challenge_fineweb.py \
       --variant "${FINEWEB_VARIANT}" \
       --train-shards "${TRAIN_SHARDS}"
+  elif [[ "${FINEWEB_VARIANT}" == "sp8192" ]]; then
+    # Prefer downloading the already-exported dual_bpe SP8192 dataset from HF.
+    # This avoids expensive local re-export and keeps paths aligned with training defaults.
+    log "downloading exported SP8192 dual_bpe dataset from HF: ${HF_EXPORTED_DATASET_REPO}"
+    mkdir -p "./data/dual_bpe/datasets"
+    python - <<PY
+from huggingface_hub import snapshot_download
+snapshot_download(
+    repo_id="${HF_EXPORTED_DATASET_REPO}",
+    repo_type="dataset",
+    local_dir="./data/dual_bpe/datasets",
+    allow_patterns=["fineweb10B_sp8192/*"],
+)
+print("download complete")
+PY
+    DATA_DIR="${DUAL_BPE_DIR}"
   elif [[ "${FINEWEB_VARIANT}" =~ ^sp([0-9]+)$ ]]; then
     vocab_size="${BASH_REMATCH[1]}"
     log "building/exporting local variant=${FINEWEB_VARIANT} (VOCAB_SIZE=${vocab_size})"
