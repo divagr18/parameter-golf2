@@ -88,10 +88,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 class Hyperparameters:
     # Data paths are shard globs produced by the existing preprocessing pipeline.
-    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp8192")
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_8192_bpe.model")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -191,7 +191,7 @@ class Hyperparameters:
     mtp_tie_embeddings = bool(int(os.environ.get("MTP_TIE_EMBEDDINGS", "1")))
     mtp_lr = float(os.environ.get("MTP_LR", "0.02"))
     # On-the-fly distillation (EMA teacher) in the late training tail.
-    distill_enabled = bool(int(os.environ.get("DISTILL_ENABLED", "0")))
+    distill_enabled = bool(int(os.environ.get("DISTILL_ENABLED", "1")))
     distill_start_frac = float(os.environ.get("DISTILL_START_FRAC", "0.7"))
     # Optional overrides for wallclock-capped runs. DISTILL_START_STEP wins over frac.
     # DISTILL_START_WALLCLOCK_FRAC keys distillation off elapsed/max_wallclock instead of ITERATIONS.
@@ -214,10 +214,6 @@ class Hyperparameters:
     jpcr_blend_init = float(os.environ.get("JPCR_BLEND_INIT", "-2.0"))  # logit for sigmoid gate init (~0.12)
     jpcr_lr = float(os.environ.get("JPCR_LR", "0.02"))  # predictor learning rate
     jpcr_warmup_steps = int(os.environ.get("JPCR_WARMUP_STEPS", "200"))  # ramp JPCR loss weight over this many steps after activation
-    # Distillation/JPCR application cadence. 1 = apply every step.
-    # When >1, distill+JPCR are applied every Nth step (no stale-target reuse).
-    _jpcr_apply_every_env = os.environ.get("JPCR_APPLY_EVERY", os.environ.get("JPCR_TEACHER_EVERY", "1"))
-    jpcr_apply_every = max(1, int(_jpcr_apply_every_env))
     # Dual-head objective: auxiliary coarse-structure prediction head.
     # Classes are derived from token properties (boundary/space/byte-length) and trained
     # with a small coefficient so the main LM head can focus on harder entropy.
@@ -262,7 +258,7 @@ class Hyperparameters:
     gptq_percdamp = float(os.environ.get("GPTQ_PERCDAMP", "0.01"))
 
     # Model shape.
-    vocab_size = int(os.environ.get("VOCAB_SIZE", 8192))
+    vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
@@ -2563,7 +2559,7 @@ class JPCRPredictor(nn.Module):
 
     Architecture:
       Blend path: RMSNorm → Linear(dim, hidden) → SiLU → Linear(hidden, dim) → residual
-      Loss path:  shared Linear(dim, proj_dim) on prediction and normalized target, cosine loss
+      Loss path:  Linear(dim, proj_dim) on both prediction and target, cosine loss
 
     The blend path modifies the recurrence input at inference (no teacher needed).
     The loss path trains the predictor — projects to proj_dim for stable, bounded loss.
@@ -2584,6 +2580,7 @@ class JPCRPredictor(nn.Module):
         nn.init.zeros_(self.proj_out.bias)
         # Loss projection heads (BYOL-style): project to smaller space for loss
         self.student_proj = nn.Linear(model_dim, proj_dim, bias=False)
+        self.teacher_proj = nn.Linear(model_dim, proj_dim, bias=False)
 
     def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
         """Returns (predicted_target, gate_value). No loss computation here."""
@@ -2603,7 +2600,7 @@ class JPCRPredictor(nn.Module):
         # Instance-normalize teacher target (data2vec): zero-mean, unit-var per token
         t = teacher_target.float()
         t = (t - t.mean(dim=-1, keepdim=True)) / (t.std(dim=-1, keepdim=True) + 1e-6)
-        # Project both to smaller space with shared projector, detach target branch.
+        # Project both to smaller space. SimSiam/BYOL style: target uses same projection but detached.
         s_proj = self.student_proj(predicted_target.float())
         t_proj = self.student_proj(t).detach()
         # Cosine similarity loss: 1 - cos_sim, bounded [0, 2]
@@ -3258,12 +3255,6 @@ class GPT(nn.Module):
             else:
                 aux_loss = aux_per_token.mean()
             total_loss = total_loss + float(aux_weight) * aux_loss
-        elif self.dual_head is not None:
-            # Safety touch keeps dual-head params in graph when auxiliary loss is inactive.
-            total_loss = total_loss + 0.0 * (
-                self.dual_head.weight.reshape(-1)[0].float()
-                + (self.dual_head.bias.reshape(-1)[0].float() if self.dual_head.bias is not None else 0.0)
-            )
 
         if logit_reg_weight > 0.0:
             total_loss = total_loss + float(logit_reg_weight) * logits_proj.float().pow(2).mean()
@@ -3298,11 +3289,6 @@ class GPT(nn.Module):
         if jpcr_count > 0:
             total_loss = total_loss + float(jpcr_weight) * (jpcr_loss / jpcr_count)
             total_loss = total_loss + 0.0 * jpcr_loss
-        if self.jpcr_enabled and len(self.jpcr_predictors) > 0:
-            # Safety touch keeps ALL JPCR params in graph every step (zero gradient where unused).
-            # This supports DDP find_unused_parameters=False with conditional JPCR execution.
-            for p in self.jpcr_predictors.parameters():
-                total_loss = total_loss + 0.0 * p.reshape(-1)[0].float()
 
         # MoE router Z-loss — only during training (loss_mask is None means no sliding-window eval mask).
         # Follows the same pattern as MTP (excluded during eval to keep val_bpb clean).
@@ -3409,17 +3395,6 @@ def main() -> None:
         torch.cuda.set_device(device)
     autocast_enabled = device.type == "cuda"
     use_compile = bool(int(os.environ.get("USE_TORCH_COMPILE", "1" if device.type == "cuda" else "0")))
-    compile_dynamic_mode_raw = os.environ.get("TORCH_COMPILE_DYNAMIC", "true").strip().lower()
-    if compile_dynamic_mode_raw in {"1", "true", "yes", "on"}:
-        compile_dynamic: bool | None = True
-    elif compile_dynamic_mode_raw in {"0", "false", "no", "off"}:
-        compile_dynamic = False
-    elif compile_dynamic_mode_raw in {"none", "auto", "default", ""}:
-        compile_dynamic = None
-    else:
-        raise ValueError(
-            f"Unsupported TORCH_COMPILE_DYNAMIC={compile_dynamic_mode_raw!r}; expected true|false|none"
-        )
     if use_compile:
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
     if distributed:
@@ -3482,11 +3457,7 @@ def main() -> None:
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
-    log0(
-        f"device:{device} distributed:{distributed} use_torch_compile:{use_compile} "
-        f"torch_compile_dynamic:{compile_dynamic}",
-        console=False,
-    )
+    log0(f"device:{device} distributed:{distributed} use_torch_compile:{use_compile}", console=False)
     if device.type == "cuda":
         log0(
             subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False).stdout,
@@ -3636,24 +3607,16 @@ def main() -> None:
         # Python int instance attrs (num_heads, head_dim) are captured as symbolic inputs
         # to a subgraph. With world_size=1 the optimisation is a no-op anyway.
         torch._dynamo.config.optimize_ddp = False
-    compiled_model = torch.compile(base_model, dynamic=compile_dynamic) if use_compile else base_model
+    compiled_model = torch.compile(base_model, dynamic=True) if use_compile else base_model
     model: nn.Module
     if distributed:
-        ddp_find_unused_override = os.environ.get("DDP_FIND_UNUSED_PARAMETERS", "").strip().lower()
         # find_unused_parameters=True is required when QAT_LSQ=1 because
         # qat_log_scale params are registered but sit idle until QAT activates.
-        # Dual-head and JPCR are safety-touched in loss so they remain in graph with zero grads.
-        if ddp_find_unused_override in {"1", "true", "yes", "on"}:
-            _ddp_find_unused = True
-        elif ddp_find_unused_override in {"0", "false", "no", "off"}:
-            _ddp_find_unused = False
-        elif ddp_find_unused_override in {"", "auto", "default"}:
-            _ddp_find_unused = bool(args.qat_lsq)
-        else:
-            raise ValueError(
-                f"Unsupported DDP_FIND_UNUSED_PARAMETERS={ddp_find_unused_override!r}; expected true|false|auto"
-            )
-        log0(f"ddp_find_unused_parameters:{int(_ddp_find_unused)}", console=False)
+        # Dual-head params can also be intentionally inactive during warmup / before
+        # DUAL_HEAD_START_FRAC, so include that condition as well.
+        # JPCR predictors also have projection heads that are only used once the
+        # JEPA/distill path is active, so treat them as potentially-unused too.
+        _ddp_find_unused = bool(args.qat_lsq or args.dual_head_enabled or args.jpcr_enabled)
         model = (
             DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False, find_unused_parameters=_ddp_find_unused)
             if device.type == "cuda"
@@ -3843,7 +3806,6 @@ def main() -> None:
         f"distill_enabled:{args.distill_enabled} distill_start_frac:{args.distill_start_frac} "
         f"distill_start_step:{args.distill_start_step} distill_start_wallclock_frac:{args.distill_start_wallclock_frac} "
         f"distill_weight:{args.distill_weight} distill_temp:{args.distill_temp} distill_ema_decay:{args.distill_ema_decay} "
-        f"jpcr_apply_every:{args.jpcr_apply_every} "
         f"logit_reg_weight:{args.logit_reg_weight} byte_weighted_loss:{args.byte_weighted_loss_enabled} "
         f"byte_weighted_loss_alpha:{args.byte_weighted_loss_alpha} "
         f"residual_ngram_enabled:{args.residual_ngram_enabled} residual_bigram_rank:{args.residual_bigram_rank} "
@@ -4028,8 +3990,6 @@ def main() -> None:
             )
         )
         log0(f"distill_start: mode:{distill_mode} resolved_step:{distill_start_step}")
-        if args.jpcr_apply_every > 1:
-            log0(f"jpcr_apply_every:{args.jpcr_apply_every} (distill+JPCR applied every Nth step)")
 
     # -----------------------------
     # MAIN TRAINING LOOP
@@ -4165,8 +4125,7 @@ def main() -> None:
             and args.distill_weight > 0.0
             and distill_is_active(args, step, elapsed_ms, max_wallclock_ms, distill_start_step)
         )
-        apply_distill_this_step = bool(distill_active and (step % args.jpcr_apply_every == 0))
-        jpcr_runtime_active = bool(base_model.jpcr_enabled and apply_distill_this_step)
+        jpcr_runtime_active = bool(base_model.jpcr_enabled and distill_active)
         # JPCR loss warmup: ramp weight from 0 → full over jpcr_warmup_steps after distill activates.
         # Also freeze blend gates for first 300 steps so predictors learn via loss before affecting forward pass.
         if distill_active and base_model.jpcr_enabled:
@@ -4206,13 +4165,13 @@ def main() -> None:
             token_weights: Tensor | None = None
             aux_targets: Tensor | None = None
             train_loss_mask = build_train_loss_mask(x.size(0), curr_seq_len)
-            if apply_distill_this_step and ema_teacher is not None:
+            if distill_active and ema_teacher is not None:
                 # Use no_grad (not inference_mode) because inference tensors can error when
                 # downstream ops save them for backward (e.g., KL in distillation under compile).
                 # Wrap in autocast to match training dtype (bf16) — teacher weights are bf16.
                 with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
                     if jpcr_runtime_active and args.jpcr_weight > 0.0:
-                        # Capture both logits and per-block intermediates for JPCR.
+                        # Capture both logits and per-block intermediates for JPCR
                         teacher_logits, teacher_intermediates = ema_teacher.forward_logits_and_intermediates(
                             x, jpcr_runtime_active=True
                         )
@@ -4253,7 +4212,7 @@ def main() -> None:
                         aux_targets=aux_targets,
                         aux_weight=dual_head_active_weight,
                         distill_teacher_logits=teacher_logits,
-                        distill_weight=args.distill_weight if apply_distill_this_step else 0.0,
+                        distill_weight=args.distill_weight if distill_active else 0.0,
                         distill_temp=args.distill_temp,
                         logit_reg_weight=args.logit_reg_weight,
                         jpcr_teacher_intermediates=teacher_intermediates,
@@ -4269,7 +4228,7 @@ def main() -> None:
                     aux_targets=aux_targets,
                     aux_weight=dual_head_active_weight,
                     distill_teacher_logits=teacher_logits,
-                    distill_weight=args.distill_weight if apply_distill_this_step else 0.0,
+                    distill_weight=args.distill_weight if distill_active else 0.0,
                     distill_temp=args.distill_temp,
                     logit_reg_weight=args.logit_reg_weight,
                     jpcr_teacher_intermediates=teacher_intermediates,
@@ -4522,3 +4481,182 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+====================================================================================================
+Running Python 3.11.10 (main, Sep  7 2024, 18:35:41) [GCC 11.4.0]
+Running PyTorch 2.10.0+cu128
+device:cuda:0 distributed:True use_torch_compile:True
+Tue Apr 28 13:32:46 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.126.09             Driver Version: 580.126.09     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:19:00.0 Off |                    0 |
+| N/A   48C    P0            130W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          On  |   00000000:3B:00.0 Off |                    0 |
+| N/A   38C    P0            119W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          On  |   00000000:4C:00.0 Off |                    0 |
+| N/A   36C    P0            121W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          On  |   00000000:5D:00.0 Off |                    0 |
+| N/A   47C    P0            123W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H100 80GB HBM3          On  |   00000000:9B:00.0 Off |                    0 |
+| N/A   49C    P0            132W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H100 80GB HBM3          On  |   00000000:BB:00.0 Off |                    0 |
+| N/A   37C    P0            123W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H100 80GB HBM3          On  |   00000000:CB:00.0 Off |                    0 |
+| N/A   47C    P0            127W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H100 80GB HBM3          On  |   00000000:DB:00.0 Off |                    0 |
+| N/A   38C    P0            124W /  700W |    1521MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path=/workspace/parameter-golf/data/tokenizers/fineweb_8192_bpe.model
+train_loader:dataset:fineweb10B_sp8192 train_shards:80
+val_loader:shards pattern=/workspace/parameter-golf/data/dual_bpe/datasets/fineweb10B_sp8192/fineweb_val_*.bin tokens:40541184 val_max_tokens:full
+eval_primary: seq_len:1024 rope_scale:1.0000 stride_frac:0.5000 final_eval_mode:primary
+eval_cont_cache: enabled:0 window:8192 topk:64 weight:0.1200 logit_scale:12.0000 conf_power:1.0000 batch_seqs:8
+train_loss_mask: enabled:0 stride_frac:0.5000
+model_params:16074312
+world_size:8 grad_accum_steps:1
+sdp_backends:cudnn=False flash=True mem_efficient=False math=False mode=flash
+attention_mode:gqa num_heads:8 num_kv_heads:4 use_swiglu:True use_ssm:False ssm_every_n:2 ssm_expand:2.0 ssm_kernel:4 mtp_enabled:False mtp_steps:2 mtp_weight:0.3 mtp_decay:1.0 mtp_tie_embeddings:True distill_enabled:False distill_start_frac:-1.0 distill_start_step:-1 distill_start_wallclock_frac:-1.0 distill_weight:0.1 distill_temp:1.5 distill_ema_decay:0.999 logit_reg_weight:0.0 byte_weighted_loss:False byte_weighted_loss_alpha:1.0 residual_ngram_enabled:False residual_bigram_rank:0 residual_trigram_rank:0 residual_ngram_lr:0.04 residual_ngram_mix_init:-2.5 ngram_softcap:0.0 ngram_entropy_gate:False ttt_enabled:False ttt_lr:0.001 ttt_steps:1 ttt_momentum:0.9 copy_cache_enabled:False copy_cache_window:256 copy_cache_dim:64 copy_cache_lr:0.02 copy_cache_gate_init:-4.0 dual_head_enabled:False dual_head_weight:0.05 dual_head_start_frac:0.0 dual_head_lr:0.02 qat_scheme:none qat_start_step:9000 moe_num_experts:0 moe_every_n:2 moe_capacity_factor:1.0 moe_aux_loss_coeff:0.001 num_moe_blocks:0
+architecture:stacked num_layers:9 encoder_layers:4 decoder_layers:5 ssm_blocks:0 attn_blocks:9
+tie_embeddings:True embed_lr:0.05 head_lr:0.0 matrix_lr:0.04 scalar_lr:0.04 mtp_lr:0.0 copy_cache_lr:0.0 dual_head_lr:0.0
+train_batch_tokens:524288 train_seq_len:1024 iterations:20000 warmup_steps:200 max_wallclock_seconds:600.000
+seed:1337
+Initializing DistributedTokenLoader...
+Saving initial model and optimizer states for warmup...
+Starting warmup loop (200 steps). The first step will trigger torch.compile and may take several minutes...
+warmup_step:1/200
+warmup_step:10/200
+warmup_step:20/200
+warmup_step:30/200
+warmup_step:40/200
+warmup_step:50/200
+warmup_step:60/200
+warmup_step:70/200
+warmup_step:80/200
+warmup_step:90/200
+warmup_step:100/200
+warmup_step:110/200
+warmup_step:120/200
+warmup_step:130/200
+warmup_step:140/200
+warmup_step:150/200
+warmup_step:160/200
+warmup_step:170/200
+warmup_step:180/200
+warmup_step:190/200
+warmup_step:200/200
+step:1/20000 train_loss:9.0058 train_time:97ms step_avg:97.46ms
+step:2/20000 train_loss:15.2811 train_time:133ms step_avg:66.74ms
+step:3/20000 train_loss:11.7764 train_time:184ms step_avg:61.48ms
+step:4/20000 train_loss:9.3066 train_time:233ms step_avg:58.35ms
+step:5/20000 train_loss:8.6009 train_time:280ms step_avg:56.09ms
+step:6/20000 train_loss:8.2691 train_time:330ms step_avg:54.97ms
+step:7/20000 train_loss:7.8606 train_time:379ms step_avg:54.16ms
+step:8/20000 train_loss:7.7387 train_time:429ms step_avg:53.57ms
+step:9/20000 train_loss:7.4589 train_time:478ms step_avg:53.10ms
+step:10/20000 train_loss:7.3734 train_time:527ms step_avg:52.73ms
+step:200/20000 train_loss:3.8689 train_time:9949ms step_avg:49.74ms
+step:400/20000 train_loss:3.6586 train_time:21671ms step_avg:54.18ms
+step:600/20000 train_loss:3.5931 train_time:31550ms step_avg:52.58ms
+step:800/20000 train_loss:3.4265 train_time:41467ms step_avg:51.83ms
+step:1000/20000 train_loss:3.2023 train_time:51403ms step_avg:51.40ms
+step:1200/20000 train_loss:3.4225 train_time:61344ms step_avg:51.12ms
+step:1400/20000 train_loss:3.5038 train_time:71292ms step_avg:50.92ms
+step:1600/20000 train_loss:3.5095 train_time:81237ms step_avg:50.77ms
+step:1800/20000 train_loss:3.2936 train_time:91181ms step_avg:50.66ms
+step:2000/20000 train_loss:3.3047 train_time:101122ms step_avg:50.56ms
+step:2200/20000 train_loss:3.3670 train_time:111839ms step_avg:50.84ms
+step:2400/20000 train_loss:3.3340 train_time:121761ms step_avg:50.73ms
+step:2600/20000 train_loss:3.3233 train_time:131676ms step_avg:50.64ms
+step:2800/20000 train_loss:3.4029 train_time:141590ms step_avg:50.57ms
+step:3000/20000 train_loss:3.3398 train_time:151501ms step_avg:50.50ms
+step:3200/20000 train_loss:3.4832 train_time:161408ms step_avg:50.44ms
+step:3400/20000 train_loss:3.4115 train_time:171316ms step_avg:50.39ms
+step:3600/20000 train_loss:3.2073 train_time:181225ms step_avg:50.34ms
+step:3800/20000 train_loss:3.2038 train_time:191138ms step_avg:50.30ms
+step:4000/20000 train_loss:3.2229 train_time:201846ms step_avg:50.46ms
+step:4200/20000 train_loss:3.1401 train_time:211829ms step_avg:50.44ms
+step:4400/20000 train_loss:3.2384 train_time:221737ms step_avg:50.39ms
+step:4600/20000 train_loss:3.1954 train_time:231650ms step_avg:50.36ms
+step:4800/20000 train_loss:3.2270 train_time:241565ms step_avg:50.33ms
+step:5000/20000 train_loss:3.3403 train_time:251477ms step_avg:50.30ms
+step:5200/20000 train_loss:3.3649 train_time:261382ms step_avg:50.27ms
+step:5400/20000 train_loss:3.1725 train_time:271287ms step_avg:50.24ms
+step:5600/20000 train_loss:3.2859 train_time:281188ms step_avg:50.21ms
+step:5800/20000 train_loss:3.1946 train_time:291580ms step_avg:50.27ms
+step:6000/20000 train_loss:3.2641 train_time:301484ms step_avg:50.25ms
+step:6200/20000 train_loss:3.2649 train_time:311383ms step_avg:50.22ms
+step:6400/20000 train_loss:3.3021 train_time:321282ms step_avg:50.20ms
+step:6600/20000 train_loss:3.2920 train_time:331185ms step_avg:50.18ms
+step:6800/20000 train_loss:3.0168 train_time:341087ms step_avg:50.16ms
+step:7000/20000 train_loss:3.1389 train_time:350990ms step_avg:50.14ms
+step:7200/20000 train_loss:3.1020 train_time:360890ms step_avg:50.12ms
+step:7400/20000 train_loss:3.2814 train_time:370790ms step_avg:50.11ms
+step:7600/20000 train_loss:3.2986 train_time:381419ms step_avg:50.19ms
+step:7800/20000 train_loss:3.2627 train_time:391320ms step_avg:50.17ms
+step:8000/20000 train_loss:3.2763 train_time:401226ms step_avg:50.15ms
+step:8200/20000 train_loss:3.1913 train_time:411130ms step_avg:50.14ms
+step:8400/20000 train_loss:3.1339 train_time:421090ms step_avg:50.13ms
+step:8600/20000 train_loss:3.2632 train_time:430991ms step_avg:50.12ms
+step:8800/20000 train_loss:3.2629 train_time:440894ms step_avg:50.10ms
+step:9000/20000 train_loss:3.1821 train_time:450910ms step_avg:50.10ms
+step:9200/20000 train_loss:3.1576 train_time:461762ms step_avg:50.19ms
+step:9400/20000 train_loss:3.2446 train_time:472763ms step_avg:50.29ms
+step:9600/20000 train_loss:3.1757 train_time:483436ms step_avg:50.36ms
+step:9800/20000 train_loss:3.1317 train_time:494145ms step_avg:50.42ms
+step:10000/20000 train_loss:3.0575 train_time:504813ms step_avg:50.48ms
+step:10200/20000 train_loss:3.1046 train_time:515499ms step_avg:50.54ms
+step:10400/20000 train_loss:3.0909 train_time:526167ms step_avg:50.59ms
+step:10600/20000 train_loss:3.1312 train_time:536870ms step_avg:50.65ms
+step:10800/20000 train_loss:3.2032 train_time:548181ms step_avg:50.76ms
+step:11000/20000 train_loss:3.2122 train_time:558866ms step_avg:50.81ms
+step:11200/20000 train_loss:3.1776 train_time:569537ms step_avg:50.85ms
+step:11400/20000 train_loss:3.2000 train_time:580217ms step_avg:50.90ms
+step:11600/20000 train_loss:3.1667 train_time:590894ms step_avg:50.94ms
+step:11771/20000 val_loss:3.0472 val_bpb:1.1797 train_time:600085ms step_avg:50.98ms
+stopping_early: wallclock_cap train_time:600085ms step:11771/20000
+swa: loading averaged weights from 280 snapshots
+peak memory allocated: 14871 MiB reserved: 23472 MiB
+Serialized model: 56994465 bytes
+Code size: 218848 bytes
+Total submission size: 57213313 bytes
+submission_budget raw_total:57213313 budget:16000000 over_bytes:41213313
+gptq: collecting Hessians from 128 calibration samples...
+gptq: collected 63 Hessians, quantizing with bits=8...
+gptq: quantized 63 weight matrices
+export_config quant_scheme:int8 mixed_low_precision_scheme:int8 compressor:zstd weight_order:none compress_level:-1
+Serialized model int8+zstd: 15062425 bytes (payload:16197664 raw_torch:16248437 payload_ratio:3.52x)
+Total submission size int8+zstd: 15281273 bytes
+submission_budget int8+zstd total:15281273 budget:16000000 headroom_bytes:718727
+final_int8_zstd_roundtrip_ctx_exact name:primary seq_len:1024 rope_scale:1.0000 stride_frac:0.5000 ttt:0 ttt_lr:0.001 ttt_steps:1 val_loss:3.06730555 val_bpb:1.18746481
+final_int8_zstd_roundtrip val_loss:3.0673 val_bpb:1.1875 eval_time:5467ms mode:primary
+final_int8_zstd_roundtrip_exact val_loss:3.06730555 val_bpb:1.18746481 mode:primary
