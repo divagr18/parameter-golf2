@@ -8,8 +8,8 @@ BPE_TOK="${BPE_TOK:-/workspace/parameter-golf/data/tokenizers/fineweb_8192_bpe.m
 WAIT_SHARDS="${WAIT_SHARDS:-80}"
 SEED="${1:-${SEED:-1337}}"
 
-# 12 minutes
-MAX_WALLCLOCK_SECONDS="${MAX_WALLCLOCK_SECONDS:-720}"
+# 30 minutes
+MAX_WALLCLOCK_SECONDS="${MAX_WALLCLOCK_SECONDS:-1800}"
 ITERATIONS="${ITERATIONS:-50000}"
 
 # JPCR activation timing for this run.
@@ -19,8 +19,8 @@ DISTILL_START_STEP="${DISTILL_START_STEP:--1}"
 # Apply distill/JPCR every Nth step (correct; no stale-target cache reuse).
 JPCR_APPLY_EVERY="${JPCR_APPLY_EVERY:-2}"
 
-RUN_GROUP="${RUN_GROUP:-sp8192_bpe_12m_jepa_s${SEED}_$(date +%Y%m%d_%H%M%S)}"
-RUN_ID="${RUN_ID:-sp8192_bpe_submission_8gpu_12m_jepa_s${SEED}_$(date +%Y%m%d_%H%M%S)}"
+RUN_GROUP="${RUN_GROUP:-sp8192_bpe_30m_jepa_s${SEED}_$(date +%Y%m%d_%H%M%S)}"
+RUN_ID="${RUN_ID:-sp8192_bpe_submission_8gpu_30m_jepa_s${SEED}_$(date +%Y%m%d_%H%M%S)}"
 
 mkdir -p "logs/runs/${RUN_GROUP}" "artifacts/${RUN_GROUP}" ".cache/torchinductor" ".cache/triton"
 
@@ -41,7 +41,7 @@ while true; do
   sleep 5
 done
 
-echo "[start] launching 12m BPE JEPA run RUN_ID=${RUN_ID} SEED=${SEED}"
+echo "[start] launching 30m BPE JEPA run RUN_ID=${RUN_ID} SEED=${SEED}"
 echo "[start] JPCR trigger frac=${DISTILL_START_WALLCLOCK_FRAC} apply_every=${JPCR_APPLY_EVERY} compile_dynamic=${TORCH_COMPILE_DYNAMIC} ddp_find_unused=${DDP_FIND_UNUSED_PARAMETERS}"
 
 RUN_ID="${RUN_ID}" \
