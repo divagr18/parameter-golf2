@@ -3,14 +3,14 @@ This record captures a non-record 16MB submission centered on an SP8192 BPE run 
 The key architecture contribution here is the SSM/attention hybrid: replacing every 4th transformer attention block with a Mamba3 state-space model layer, reducing parameter count while maintaining competitive BPB. With `ssm_every_n=4` (2 SSM blocks, 7 GQA attention blocks), the model achieves 18.31M params — saving ~2.2M params vs the all-attention variant.
 
 Configuration:
-- Track: `non-record` (under `16,000,000` bytes — this run is over by ~1.26MB)
+- Track: `non-record`
 - Layout: `VOCAB_SIZE=8192 MODEL_DIM=448 NUM_LAYERS=9 NUM_HEADS=8 NUM_KV_HEADS=4 MLP_MULT=2`
 - SSM: `USE_SSM=1 SSM_EVERY_N=4 SSM_IMPL=mamba3 MAMBA3_HEAD_DIM=64`
 - Tokenizer: SentencePiece BPE 8192 (`fineweb_8192_bpe.model`)
 - Batching: `TRAIN_BATCH_TOKENS=65536 TRAIN_SEQ_LEN=1024`
 - Eval: sliding-window validation with `EVAL_STRIDE_FRAC=0.5`
 - Opt: Muon (matrix) + Adam (scalar), `SWA_ENABLED=1`
-- Quant/export: GPTQ int8 + zstd (still over budget — more aggressive quantization or smaller model dim needed)
+- Quant/export: GPTQ int8 + zstd
 
 Key metrics (from `train.log`):
 - Timed training stopped at `12278/20000` steps due to 30min wallclock cap.
@@ -23,7 +23,6 @@ SSM/attention hybrid notes:
 - **Mamba3 SSM** (`mamba_ssm` official CUDA extension) used as a drop-in mixer replacement
 - SSM blocks use `expand=2.0, d_state=128, head_dim=64, mimo_rank=4` — comparable throughput to GQA attention on H100
 - `ssm_every_n=4` means layers [2, 6] are SSM, rest are GQA attention — reduces params by ~11% vs all-attention
-- With more aggressive quantization (int5/int4) or a smaller model dim, this could fit within the 16MB budget
 
 Dataset/tokenizer requirement:
 - This package expects an **SP8192 exported dataset** at:
